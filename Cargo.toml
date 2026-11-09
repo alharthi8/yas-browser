@@ -1,0 +1,33 @@
+[package]
+name = "yas"
+version = "0.4.5"
+edition = "2021"
+build = false
+description = "A lightweight Rust desktop browser for Windows"
+
+[dependencies]
+wry = { version = "=0.57.1", features = ["devtools"] }
+tao = "=0.37.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+url = "2"
+directories = "6"
+rfd = "0.15"
+csv = "1"
+windows = { version = "0.62", features = ["Win32_Security_Cryptography", "Win32_System_Memory", "Win32_System_Threading", "Win32_System_LibraryLoader", "Win32_Graphics_Gdi", "Win32_Foundation", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging", "Win32_UI_Shell", "Win32_Storage_FileSystem"] }
+
+webview2-com = "0.39"
+adblock = "=0.13.5"
+ureq = "3"
+base64 = "0.22"
+
+
+
+[profile.release]
+opt-level = 2
+strip = true
+
+[profile.release.build-override]
+debug = true
+
+

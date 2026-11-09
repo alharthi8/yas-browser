@@ -1,0 +1,27 @@
+# Yas installer
+
+Build with Inno Setup 6.7+ or 7:
+
+```powershell
+.\package.ps1 -Executable .\Yas.exe -Version 0.4.5 -Compiler 'C:\path\to\ISCC.exe'
+```
+
+The per-user installer targets `%LOCALAPPDATA%\Programs\Yas`, creates a Start menu shortcut, and offers an optional desktop shortcut. It does not request administrator access or change the default browser. It includes the app and dependency notices, not Rust source/build caches. Uninstall removes application files and shortcuts while preserving `%LOCALAPPDATA%\Yas\Yas\data`. The stable application ID recognizes the previous browser. For the rename upgrade, setup verifies the registered legacy product and uninstaller path, runs that product's uninstaller to remove its logged application files/shortcuts, then installs Yas in the new folder. Existing profile data remains separate; Yas migrates it on first launch. The installer never recursively deletes a profile directory.
+
+## Updating a background download manager
+
+From 0.4.4, X may hide Yas to the tray while live downloads continue. Before installing or uninstalling, wait for transfers to finish or explicitly choose tray Exit after accepting that unfinished native jobs will stop. Verify that every process using the installed executable has exited before replacing it; a second profile may also be using that file. Reopening the Start menu entry is a request to show the existing per-profile instance, not a request to stop it.
+
+The installer uses `CloseApplications=no` and an exclusive, no-write update probe on the intended application executable (plus a verified legacy executable before retirement). A running/locked or unwritable target blocks preparation with an explicit Exit/defer message; the probe is repeated immediately before copying Yas.exe. The uninstaller also checks its application image before removing files. Missing targets permit fresh installation or cleanup of a partially removed installation. This is a best-effort file-in-use check, not an atomic lock across installation: automation must still coordinate an explicit update/exit first, prevent reopening until setup completes, and verify the installed hash. Use `/NOCLOSEAPPLICATIONS /NOFORCECLOSEAPPLICATIONS /NORESTARTAPPLICATIONS /NORESTART /RESTARTEXITCODE=3010`; do not override this policy with close/force-close flags. Treat nonzero/reboot-required exit statuses as incomplete updates. No updater or transfer migration across a real process restart is implemented. See [Inno's application-closing behavior](https://jrsoftware.org/ishelp/topic_setup_closeapplications.htm) and [command-line flags](https://jrsoftware.org/ishelp/topic_setupcmdline.htm).
+
+From 0.4.5, Setup compares numeric versions from the target executable and the same-product registration. A newer installed version blocks replacement; an equal-version repair or an upgrade is allowed. Previously distributed installers retain their original behavior, so use the current installer rather than an older file for repairs.
+
+Regular download metadata is preserved separately in `downloads.dpapi`; it is encrypted for the current Windows account. Private transfer records are not saved. Preserving this file does not preserve a live operation: after a true process/Windows restart unfinished regular entries must show Interrupted and must not offer native Continue without a new operation.
+
+WebView2 is detected from Microsoft's documented EdgeUpdate registry keys in 32-bit and 64-bit views. The official Microsoft-signed Evergreen Bootstrapper is bundled. If the Runtime is absent, interactive Setup asks Yes/No before running the helper with `/silent /install`, then rechecks for the Runtime before copying Yas files. This runs from the non-elevated, per-user Yas installer; Microsoft may use its existing machine-wide updater if one is already present. If the Runtime is already present, the helper is not run. Silent Yas Setup without a Runtime fails with instructions; it does not assume consent. This is an online bootstrapper, not the full offline engine installer. It requires internet when installing a missing Runtime. The portable ZIP contains the same helper and instructions in `prerequisites/`.
+
+At package time, `package.ps1` requires valid Microsoft Authenticode signatures on the Bootstrapper and app-local CRT DLLs, checks the Bootstrapper against its source-provenance hash, and embeds that SHA-256 in Setup. The extracted helper's hash is checked again before execution. The helper has not been executed on the development computer by this work: its WebView2 Runtime already exists. Missing-runtime installation is therefore code-reviewed/compiled but not live-tested on a Runtime-free machine.
+
+The script packages the official MSVC runtime DLLs from the `runtime` folder beside the app. You can override this with `-RuntimeFiles` pointing to an official `x64\Microsoft.VC143.CRT` redistributable directory from Visual Studio; do not use files from debug_nonredist or onecore folders. A fully static CRT build can pass `-RuntimeFiles ''`. The script also produces a portable ZIP with these DLLs adjacent to `Yas.exe` and SHA-256 sidecars for both artifacts. Staging files go into `work/package-staging` by default and can be redirected with `-StagingDirectory`.
+
+Compiler sources and docs: https://jrsoftware.org/isdl.php and https://jrsoftware.org/ishelp/. WebView2 deployment: https://learn.microsoft.com/microsoft-edge/webview2/concepts/distribution.
