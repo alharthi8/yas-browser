@@ -68,7 +68,7 @@ jobs:
           } finally { if (Test-Path $key) { Remove-Item -LiteralPath $key } }
           $installer = (Get-ChildItem 'release-output/*Setup*.exe' | Select-Object -First 1).FullName
           if (!$installer) { throw 'Bootstrap installer was not produced' }
-          gh release create "v$version" $asset $installer --draft --title 'yas-browser signed-update preview' --notes 'Windows preview with signed in-app updates. Install this bootstrap release once. Later updates are available from Settings > Check for app updates. Quit and reopen when convenient after applying an update. OS publisher signing is not configured. macOS is not available yet.'
+          gh release create "v$version" $asset $installer --target "$env:GITHUB_SHA" --draft --title 'yas-browser signed-update preview' --notes 'Windows preview with signed in-app updates. Install this bootstrap release once. Later updates are available from Settings > Check for app updates. Quit and reopen when convenient after applying an update. OS publisher signing is not configured. macOS is not available yet.'
           if ($LASTEXITCODE -ne 0) { throw 'Draft release upload failed' }
           gh release edit "v$version" --draft=false --latest
           if ($LASTEXITCODE -ne 0) { throw 'Release publication failed' }
