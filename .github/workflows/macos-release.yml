@@ -1,0 +1,68 @@
+name: Signed macOS preview
+on:
+  push:
+    branches: [main, codex/macos]
+    tags: ['macos-v*']
+    paths: ['macos/**', 'release.pub', '.github/workflows/macos-release.yml']
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish the tested experimental preview
+        type: boolean
+        default: false
+permissions:
+  contents: write
+concurrency:
+  group: macos-release
+  cancel-in-progress: false
+jobs:
+  apple-silicon:
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '13.0'
+      CARGO_BUILD_TARGET: aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: 'macos -> target'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Validate architecture and version
+        run: |
+          test "$(uname -m)" = arm64
+          version="$(python3 -c 'import tomllib;print(tomllib.load(open("macos/Cargo.toml","rb"))["package"]["version"])')"
+          if [ "$GITHUB_REF_TYPE" = tag ]; then test "$GITHUB_REF_NAME" = "macos-v$version"; fi
+          echo "YAS_RELEASE_VERSION=$version" >> "$GITHUB_ENV"
+      - name: Build and test native application
+        run: bash macos/build.sh
+      - name: Launch packaged app and verify frontend handshake
+        run: python3 macos/scripts/native-smoke.py "macos/dist/Yas Browser.app/Contents/MacOS/yas-macos"
+      - name: Install pinned update signing tool
+        run: cargo install zipsign --version 0.2.2 --locked --debug
+      - name: Sign release and test whole-bundle replacement and tamper rejection
+        env:
+          YAS_UPDATE_SIGNING_KEY: ${{ secrets.YAS_UPDATE_SIGNING_KEY }}
+        run: bash macos/scripts/sign-release.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: yas-browser-macos-apple-silicon
+          path: |
+            macos/dist/*.zip
+            macos/dist/SHA256SUMS.txt
+      - name: Publish experimental macOS release
+        if: startsWith(github.ref, 'refs/tags/macos-v') || inputs.publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="macos-v$YAS_RELEASE_VERSION"
+          gh release create "$tag" macos/dist/*.zip macos/dist/SHA256SUMS.txt --target "$GITHUB_SHA" --draft --prerelease --latest=false --title "Yas Browser $YAS_RELEASE_VERSION · macOS Apple Silicon preview" --notes-file macos/RELEASE-NOTES.md
+          gh release edit "$tag" --draft=false --prerelease --latest=false
