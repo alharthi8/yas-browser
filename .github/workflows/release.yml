@@ -29,14 +29,14 @@ jobs:
       - name: Build and test browser
         shell: pwsh
         run: |
-          ./build.ps1 -Test
+          ./build.ps1 -Test -Release
           ./build.ps1 -Release
           choco install innosetup --yes --no-progress
           $compiler = (Get-ChildItem 'C:/Program Files (x86)/Inno Setup*/ISCC.exe' | Select-Object -First 1).FullName
           Copy-Item target/release/yas.exe Yas.exe
           ./package.ps1 -Executable ./Yas.exe -Version $env:YAS_RELEASE_VERSION -Compiler $compiler -OutputDirectory ./release-output
       - name: Install pinned signing tool
-        run: cargo install zipsign --version 0.2.2 --locked
+        run: cargo install zipsign --version 0.2.2 --locked --debug
       - name: Sign and verify update; stage release
         shell: pwsh
         env:

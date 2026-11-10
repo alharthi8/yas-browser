@@ -22,7 +22,9 @@ if (!(Test-Path $cargo)) { $cargo = 'cargo' }
 Push-Location $PSScriptRoot
 try {
     if ($Test) {
-        & $cargo test --locked --manifest-path "$PSScriptRoot\Cargo.toml"
+        $testArgs = @('test', '--locked', '--manifest-path', "$PSScriptRoot\Cargo.toml")
+        if ($Release) { $testArgs += '--release' }
+        & $cargo @testArgs
         if ($LASTEXITCODE -ne 0) { throw "Cargo tests failed (exit $LASTEXITCODE)." }
         return
     }
