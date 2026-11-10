@@ -1,4 +1,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+mod ota;
 mod background;
 mod blocker;
 mod capture;
@@ -986,6 +987,7 @@ impl Browser {
                     self.toast("Site protection changed. Reload to apply cosmetic changes.");
                 }
             }
+            "check_app_update" => ota::check(true),
             "update_filters" => self.update_filters(),
             "custom_filters" => {
                 self.settings.custom_filters = text("rules");
@@ -1474,6 +1476,7 @@ impl Browser {
     }
 }
 fn main() {
+    if ota::diagnostic(){return;}
     if let Err(e) = run() {
         if std::env::args().any(|a| a == "--import-data") {
             eprintln!("Import failed: {e}");
@@ -1685,6 +1688,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .is_none_or(|age| age > Duration::from_secs(4 * 24 * 3600))
     {
         app.update_filters();
+        ota::check(false);
     }
     std::thread::spawn(move || loop {
         std::thread::sleep(Duration::from_secs(2));

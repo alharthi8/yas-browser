@@ -1,0 +1,73 @@
+name: Signed Windows release
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: windows-release
+  cancel-in-progress: false
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: '. -> target'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Validate release version
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path 'Cargo.toml' -Pattern '^version = "([^"]+)"' | Select-Object -First 1).Matches.Groups[1].Value
+          if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -ne "v$version") { throw 'Tag must match Cargo version' }
+      - name: Build and test browser
+        shell: pwsh
+        run: |
+          ./build.ps1 -Test
+          ./build.ps1 -Release
+          choco install innosetup --yes --no-progress
+          $compiler = (Get-ChildItem 'C:/Program Files (x86)/Inno Setup*/ISCC.exe' | Select-Object -First 1).FullName
+          Copy-Item target/release/yas.exe Yas.exe
+          ./package.ps1 -Executable ./Yas.exe -Version 0.4.6 -Compiler $compiler -OutputDirectory ./release-output
+      - name: Install pinned signing tool
+        run: cargo install zipsign --version 0.2.2 --locked
+      - name: Sign and verify update; stage release
+        shell: pwsh
+        env:
+          YAS_UPDATE_SIGNING_KEY: ${{ secrets.YAS_UPDATE_SIGNING_KEY }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = (Select-String -Path 'Cargo.toml' -Pattern '^version = "([^"]+)"' | Select-Object -First 1).Matches.Groups[1].Value
+          $asset = 'yas-browser-ota-' + $version + '-x86_64-pc-windows-msvc.zip'
+          $staging = Join-Path $env:RUNNER_TEMP 'ota-stage'
+          New-Item -ItemType Directory -Path $staging | Out-Null
+          Copy-Item 'target/release/yas.exe' (Join-Path $staging 'yas.exe')
+          Compress-Archive -Path (Join-Path $staging 'yas.exe') -DestinationPath $asset
+          $key = Join-Path $env:RUNNER_TEMP 'yas-signing.key'
+          try {
+            [IO.File]::WriteAllBytes($key,[Convert]::FromBase64String($env:YAS_UPDATE_SIGNING_KEY))
+            zipsign sign zip $asset $key
+            if ($LASTEXITCODE -ne 0) { throw 'Signing failed' }
+            zipsign verify zip $asset release.pub
+            if ($LASTEXITCODE -ne 0) { throw 'Signature verification failed' }
+            $verify = Start-Process 'target/release/yas.exe' -ArgumentList @('--yas-verify-update', $asset) -WindowStyle Hidden -Wait -PassThru
+            if ($verify.ExitCode -ne 0) { throw 'App rejected its signed update' }
+            $bad = Join-Path $env:RUNNER_TEMP $asset
+            $bytes = [IO.File]::ReadAllBytes((Resolve-Path $asset))
+            $bytes[0] = $bytes[0] -bxor 1
+            [IO.File]::WriteAllBytes($bad,$bytes)
+            $reject = Start-Process 'target/release/yas.exe' -ArgumentList @('--yas-verify-update', $bad) -WindowStyle Hidden -Wait -PassThru
+            if ($reject.ExitCode -eq 0) { throw 'App accepted a corrupted update' }
+          } finally { if (Test-Path $key) { Remove-Item -LiteralPath $key } }
+          $installer = (Get-ChildItem 'release-output/*Setup*.exe' | Select-Object -First 1).FullName
+          if (!$installer) { throw 'Bootstrap installer was not produced' }
+          gh release create "v$version" $asset $installer --draft --title 'yas-browser signed-update preview' --notes 'Windows preview with signed in-app updates. Install this bootstrap release once. Later updates are available from Settings > Check for app updates. Quit and reopen when convenient after applying an update. OS publisher signing is not configured. macOS is not available yet.'
+          if ($LASTEXITCODE -ne 0) { throw 'Draft release upload failed' }
+          gh release edit "v$version" --draft=false --latest
+          if ($LASTEXITCODE -ne 0) { throw 'Release publication failed' }
