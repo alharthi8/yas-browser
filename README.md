@@ -1,10 +1,10 @@
 # Yas — Windows browser preview
 
-Yas is a Rust desktop browser using Tao and Wry with the installed Microsoft Edge WebView2 engine. Version 0.4.5 uses Dubai, modern blue branding, a UAE-inspired falcon icon, and a Chrome-style tab strip with integrated window controls. It is a browser preview with compatibility and feature limits described below.
+Yas is a Rust desktop browser using Tao and Wry with the installed Microsoft Edge WebView2 engine. Version 0.4.6 uses Dubai, modern blue branding, a UAE-inspired falcon icon, and a Chrome-style tab strip with integrated window controls. It is a browser preview with compatibility and feature limits described below.
 
 ## Run
 
-Run `Yas-0.4.5-Setup-x64.exe` for a per-user Windows 10/11 x64 installation with Start menu shortcut and uninstaller. A desktop shortcut is optional. Upgrades and uninstall preserve your browser data. When WebView2 is missing, setup offers to run the bundled Microsoft-signed Evergreen bootstrapper. This downloads the engine and needs internet; it is not a full offline runtime. The installer asks first and does not change your default browser.
+Run `Yas-0.4.6-Setup-x64.exe` for a per-user Windows 10/11 x64 installation with Start menu shortcut and uninstaller. A desktop shortcut is optional. Upgrades and uninstall preserve your browser data. When WebView2 is missing, setup offers to run the bundled Microsoft-signed Evergreen bootstrapper. This downloads the engine and needs internet; it is not a full offline runtime. The installer asks first and does not change your default browser.
 
 Before updating or uninstalling, let live downloads finish or explicitly choose Exit from Yas's tray menu. The window's X can leave Yas running in the background. Exit stops unfinished native transfers; saved history does not make those operations resumable after the process ends.
 
@@ -31,7 +31,7 @@ The release now launches on the development computer after the user changed thei
 
 ## Limits
 
-Microsoft account password sync, Chrome Web Store installation, extension toolbar popups, native messaging integrations, password generation, Windows Hello unlock, payment autofill, a browser updater, default-browser registration, accessibility certification, and signed installers are not implemented. Extension compatibility varies. Some providers block sign-in through embedded engines. Advanced adblock scriptlets, procedural filters, redirect resources, removeparam rewriting, and guaranteed video-ad removal are not implemented. No comparative claim of “best blocker” or “lowest memory” has been verified. Performance and memory depend on pages and extensions.
+Microsoft account password sync, Chrome Web Store installation, extension toolbar popups, native messaging integrations, password generation, Windows Hello unlock, payment autofill, default-browser registration, accessibility certification, and signed installers are not implemented. Extension compatibility varies. Some providers block sign-in through embedded engines. Advanced adblock scriptlets, procedural filters, redirect resources, removeparam rewriting, and guaranteed video-ad removal are not implemented. No comparative claim of “best blocker” or “lowest memory” has been verified. Performance and memory depend on pages and extensions.
 
 The UI is a separate profile with a strict navigation allowlist and a content security policy. Remote pages receive no Yas privileged IPC bridge. WebView2 profiles share the underlying environment to avoid duplicate browser/GPU processes. The app does not read or decrypt your existing Edge profile directly.
 
@@ -74,3 +74,7 @@ See `branding/BRAND.md` for the identity and `THIRD_PARTY.md` for filter attribu
 
 Downloads use WebView2 deferrals to show the save dialog outside native callbacks. Cancel at the save prompt or use Downloads > Cancel during a transfer. Cancellation is shown separately from failure; closing a downloading tab also requests cancellation. Closing the window to the tray preserves eligible live jobs in the same process; explicit tray Exit stops them. Tiny hidden blank profile anchors preserve session cookies when page renderers are unloaded.
 
+
+## Signed in-app updates
+
+Install this updater-enabled preview once. Both the startup check and Settings → Check for app updates use GitHub Releases. Approve the update, then fully quit and reopen when convenient. Downloads are verified with the embedded public key before replacing the app executable. The active session and user-data folders are left intact. See [UPDATES.md](UPDATES.md) for release/key management and full-installer limitations. Windows Authenticode publisher signing and macOS updates are not configured.
