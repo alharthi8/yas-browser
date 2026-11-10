@@ -25,6 +25,7 @@ jobs:
         run: |
           $version = (Select-String -Path 'Cargo.toml' -Pattern '^version = "([^"]+)"' | Select-Object -First 1).Matches.Groups[1].Value
           if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -ne "v$version") { throw 'Tag must match Cargo version' }
+          "YAS_RELEASE_VERSION=$version" >> $env:GITHUB_ENV
       - name: Build and test browser
         shell: pwsh
         run: |
@@ -33,7 +34,7 @@ jobs:
           choco install innosetup --yes --no-progress
           $compiler = (Get-ChildItem 'C:/Program Files (x86)/Inno Setup*/ISCC.exe' | Select-Object -First 1).FullName
           Copy-Item target/release/yas.exe Yas.exe
-          ./package.ps1 -Executable ./Yas.exe -Version 0.4.6 -Compiler $compiler -OutputDirectory ./release-output
+          ./package.ps1 -Executable ./Yas.exe -Version $env:YAS_RELEASE_VERSION -Compiler $compiler -OutputDirectory ./release-output
       - name: Install pinned signing tool
         run: cargo install zipsign --version 0.2.2 --locked
       - name: Sign and verify update; stage release
