@@ -9,6 +9,32 @@ pub struct Suggestion {
     pub kind: &'static str,
 }
 
+fn transient_account_url(url: &url::Url) -> bool {
+    let microsoft_mail = url.host_str().is_some_and(|host| {
+        matches!(
+            host,
+            "outlook.cloud.microsoft"
+                | "outlook.office.com"
+                | "outlook.office365.com"
+                | "outlook.live.com"
+        )
+    });
+    url.query_pairs().any(|(key, _)| {
+        matches!(
+            key.to_ascii_lowercase().as_str(),
+            "domain_hint"
+                | "login_hint"
+                | "wctx"
+                | "samlrequest"
+                | "samlresponse"
+                | "client-request-id"
+                | "access_token"
+                | "id_token"
+                | "refresh_token"
+        ) || (microsoft_mail && key.eq_ignore_ascii_case("realm"))
+    })
+}
+
 /// Search local metadata only. Passwords, usernames and form values never enter
 /// the address-bar index. Private queries exclude regular browsing history.
 pub fn search(
@@ -32,6 +58,11 @@ pub fn search(
             || !url.username().is_empty()
             || url.password().is_some()
         {
+            return;
+        }
+        // History is retained, but account-specific redirects must not become
+        // reusable address-bar destinations under a generic page title.
+        if kind == "history" && transient_account_url(&url) {
             return;
         }
         let host = url.host_str().unwrap().to_lowercase();
@@ -98,6 +129,35 @@ mod tests {
             url: url.into(),
             ..Entry::default()
         }
+    }
+    #[test]
+    fn transient_account_redirects_are_not_replayed_from_history_suggestions() {
+        let mut settings = Settings::default();
+        settings.history.push(entry(
+            "Outlook",
+            "https://outlook.cloud.microsoft/mail/?realm=examplecollege.test",
+        ));
+        settings.history.push(entry(
+            "Outlook Sign in",
+            "https://login.example.test/adfs/ls/?wctx=opaque-state",
+        ));
+        settings
+            .history
+            .push(entry("Outlook", "https://outlook.live.com/mail/0/"));
+        let results = search(&settings, &[], "outlook", false);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].url, "https://outlook.live.com/mail/0/");
+        assert_eq!(settings.history.len(), 3);
+    }
+    #[test]
+    fn explicit_organization_bookmarks_remain_available() {
+        let mut settings = Settings::default();
+        let url = "https://outlook.office.com/mail/?realm=company.example";
+        settings.bookmarks.push(entry("My company mail", url));
+        assert_eq!(search(&settings, &[], "company", false)[0].url, url);
+        assert!(!transient_account_url(
+            &url::Url::parse("https://example.test/game?realm=one").unwrap()
+        ));
     }
     #[test]
     fn searches_imported_history_beyond_the_recent_panel() {

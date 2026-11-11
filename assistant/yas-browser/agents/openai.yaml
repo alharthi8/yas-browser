@@ -1,0 +1,3 @@
+interface:
+  display_name: "Yas Browser"
+  short_description: "Control Yas Browser tabs with opt-in local access"

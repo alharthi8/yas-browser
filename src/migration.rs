@@ -1,7 +1,7 @@
 //! Explicit migration of exported browser data. Never reads encrypted source-browser secrets.
+use crate::storage::{self, Address, Entry, FormEntry};
 #[cfg(test)]
-use crate::storage::Vault;
-use crate::storage::{self, Address, Entry, FormEntry, Settings};
+use crate::storage::{Settings, Vault};
 use serde::{Deserialize, Serialize};
 #[cfg(test)]
 use std::path::PathBuf;
@@ -153,45 +153,21 @@ fn normalize_address(mut a: Address) -> Address {
     a
 }
 
-fn read_optional(path: &Path) -> Result<Option<Vec<u8>>, String> {
-    match fs::read(path) {
-        Ok(bytes) => Ok(Some(bytes)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e.to_string()),
-    }
-}
-fn restore(path: &Path, bytes: Option<&[u8]>) -> Result<(), String> {
-    // A failed atomic write usually leaves the original untouched; avoid rewriting it.
-    if read_optional(path)?.as_deref() == bytes {
-        return Ok(());
-    }
-    match bytes {
-        Some(bytes) => storage::atomic_write(path, bytes),
-        None => match fs::remove_file(path) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e.to_string()),
-        },
-    }
-}
-
 /// Merge an explicit JSON export and optional locally exported password CSV into Yas.
-/// Both target files are backed up before writes; a partial write is rolled back.
+/// Back up the authoritative database state, then commit settings and the
+/// encrypted vault together so a failed import cannot leave a partial merge.
 pub fn import(root: &Path, input: &Path, password_csv: Option<&Path>) -> Result<Report, String> {
-    let export: Export =
+    let metadata = fs::metadata(input).map_err(|e| format!("Cannot read export: {e}"))?;
+    if !metadata.is_file() || metadata.len() > 64 * 1024 * 1024 {
+        return Err("Choose a browser export file smaller than 64 MiB.".into());
+    }
+    let data: serde_json::Value =
         serde_json::from_slice(&fs::read(input).map_err(|e| format!("Cannot read export: {e}"))?)
             .map_err(|e| format!("Invalid migration JSON: {e}"))?;
+    let export = decode_export(data)?;
     fs::create_dir_all(root).map_err(|e| e.to_string())?;
-    let settings_path = root.join("settings.json");
-    let vault_path = root.join("vault.dpapi");
-    let original_settings = read_optional(&settings_path)?;
-    let original_vault = read_optional(&vault_path)?;
     // Do not silently replace a damaged destination profile with defaults.
-    let mut settings: Settings = match &original_settings {
-        Some(bytes) => serde_json::from_slice(bytes)
-            .map_err(|e| format!("Existing settings could not be read: {e}"))?,
-        None => Settings::default(),
-    };
+    let mut settings = storage::read_settings(root)?;
     let mut vault = storage::read_vault(root)?;
     let settings_before = serde_json::to_value(&settings).map_err(|e| e.to_string())?;
     let vault_before = serde_json::to_value(&vault).map_err(|e| e.to_string())?;
@@ -303,38 +279,89 @@ pub fn import(root: &Path, input: &Path, password_csv: Option<&Path>) -> Result<
         .join("import-backups")
         .join(format!("migration-{stamp}"));
     fs::create_dir_all(&backup).map_err(|e| e.to_string())?;
-    if let Some(bytes) = &original_settings {
-        fs::write(backup.join("settings.json"), bytes).map_err(|e| e.to_string())?;
-    }
-    if let Some(bytes) = &original_vault {
-        fs::write(backup.join("vault.dpapi"), bytes).map_err(|e| e.to_string())?;
-    }
+    storage::export_legacy_backup(root, &backup)?;
     report.backup_directory = Some(backup.to_string_lossy().into_owned());
-    let commit = (|| {
-        if vault_changed {
-            storage::write_vault(root, &vault)?;
-        }
-        if settings_changed {
-            storage::write_settings(root, &settings)?;
-        }
-        Ok::<_, String>(())
-    })();
-    if let Err(error) = commit {
-        let settings_restore = restore(&settings_path, original_settings.as_deref());
-        let vault_restore = restore(&vault_path, original_vault.as_deref());
-        if settings_restore.is_err() || vault_restore.is_err() {
-            return Err(format!("Import failed: {error}. Automatic rollback was incomplete; original files remain in {}",backup.display()));
-        }
+    if let Err(error) = storage::write_settings_and_vault(root, &settings, &vault) {
         return Err(format!(
-            "Import failed and original Yas data was restored: {error}"
+            "Import failed: {error}. The original Yas data backup remains in {}",
+            backup.display()
         ));
     }
     Ok(report)
 }
 
+fn decode_export(data: serde_json::Value) -> Result<Export, String> {
+    if let Some(roots) = data.get("roots") {
+        fn visit(
+            value: &serde_json::Value,
+            folders: &[String],
+            depth: usize,
+            out: &mut Vec<Entry>,
+        ) -> Result<(), String> {
+            if depth > 64 {
+                return Err("The bookmark folder nesting exceeds the import limit.".into());
+            }
+            match value["type"].as_str() {
+                Some("url") => {
+                    let url = value["url"]
+                        .as_str()
+                        .ok_or("A bookmark has no website address.")?;
+                    let title = value["name"].as_str().unwrap_or(url);
+                    out.push(Entry {
+                        title: title.into(),
+                        url: url.into(),
+                        folder: (!folders.is_empty()).then(|| folders.join("/")),
+                        ..Entry::default()
+                    });
+                }
+                Some("folder") => {
+                    let children = value["children"]
+                        .as_array()
+                        .ok_or("A bookmark folder has invalid contents.")?;
+                    let mut nested = folders.to_vec();
+                    if let Some(name) = value["name"].as_str().filter(|name| !name.is_empty()) {
+                        nested.push(name.into());
+                    }
+                    for child in children {
+                        visit(child, &nested, depth + 1, out)?;
+                    }
+                }
+                _ => return Err("Unsupported Chrome or Edge bookmark entry.".into()),
+            }
+            Ok(())
+        }
+        let roots = roots
+            .as_object()
+            .ok_or("Invalid Chrome or Edge bookmark roots.")?;
+        let mut bookmarks = Vec::new();
+        for value in roots.values() {
+            visit(value, &[], 0, &mut bookmarks)?;
+        }
+        return Ok(Export {
+            source: "Chrome / Edge bookmarks".into(),
+            bookmarks,
+            ..Export::default()
+        });
+    }
+    serde_json::from_value(data).map_err(|e| format!("Invalid browser export: {e}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn settings_value(root: &Path) -> serde_json::Value {
+        serde_json::to_value(storage::read_settings(root).unwrap()).unwrap()
+    }
+    fn vault_value(root: &Path) -> serde_json::Value {
+        serde_json::to_value(storage::read_vault(root).unwrap()).unwrap()
+    }
+    fn backup_vault_value(backup: &Path) -> serde_json::Value {
+        let encrypted = fs::read(backup.join("vault.dpapi")).unwrap();
+        let mut plain = storage::protect(&encrypted, true).unwrap();
+        let value = serde_json::from_slice::<Vault>(&plain).unwrap();
+        plain.fill(0);
+        serde_json::to_value(value).unwrap()
+    }
     fn scratch(label: &str) -> PathBuf {
         let p = std::env::temp_dir().join(format!(
             "yas-migration-{label}-{}-{}",
@@ -371,7 +398,7 @@ mod tests {
             ..Default::default()
         });
         storage::write_settings(&root, &settings).unwrap();
-        fs::write(&input,r#"{"source":"Tabbit","bookmarks":[{"title":"Source title","url":"https://example.com","folder":"Work"},{"title":"New","url":"https://new.example/"},{"url":"javascript:alert(1)"}],"history":[{"url":"https://history.example/","visited_at":12345}],"addresses":[{"name":"One","city":"A"},{"name":"Two","city":"B"}],"open_tabs":[{"url":"https://tab.example/"}],"reading_list":[{"url":"https://read.example/"}]}"#).unwrap();
+        fs::write(&input,r#"{"source":"Tabbit","bookmarks":[{"title":"Source title","url":"https://example.com","folder":"Work"},{"title":"New","url":"https://new.example/"},{"url":"javascript:alert(1)"}],"history":[{"url":"https://history.example/","visited_at":12345}],"addresses":[{"name":"Synthetic private address one 049","city":"A"},{"name":"Two","city":"B"}],"open_tabs":[{"url":"https://tab.example/"}],"reading_list":[{"url":"https://read.example/"}]}"#).unwrap();
         let report = import(&root, &input, None).unwrap();
         assert_eq!(report.bookmarks_added, 2);
         assert_eq!(report.bookmarks_updated, 0);
@@ -387,9 +414,9 @@ mod tests {
         assert_eq!(settings.reading_list.len(), 1);
         let vault = storage::read_vault(&root).unwrap();
         assert_eq!(vault.addresses.len(), 2);
-        assert_eq!(vault.address.name, "One");
-        let raw = fs::read(root.join("vault.dpapi")).unwrap();
-        assert!(!String::from_utf8_lossy(&raw).contains("\"name\":\"One\""));
+        assert_eq!(vault.address.name, "Synthetic private address one 049");
+        let raw = fs::read(root.join("yas.redb")).unwrap();
+        assert!(!String::from_utf8_lossy(&raw).contains("Synthetic private address one 049"));
         let again = import(&root, &input, None).unwrap();
         assert_eq!(again.bookmarks_added, 0);
         assert_eq!(again.addresses_added, 0);
@@ -399,16 +426,60 @@ mod tests {
     #[test]
     fn malformed_password_csv_does_not_mutate_destination() {
         let root = scratch("bad-csv");
-        let settings = root.join("settings.json");
         storage::write_settings(&root, &Settings::default()).unwrap();
-        let before = fs::read(&settings).unwrap();
+        let before_settings = settings_value(&root);
+        let before_vault = vault_value(&root);
         let input = root.join("export.json");
         fs::write(&input, r#"{"bookmarks":[{"url":"https://new.example/"}]}"#).unwrap();
         let csv = root.join("bad.csv");
         fs::write(&csv, "url,username\nhttps://example.com,user\n").unwrap();
         assert!(import(&root, &input, Some(&csv)).is_err());
-        assert_eq!(fs::read(settings).unwrap(), before);
+        assert_eq!(settings_value(&root), before_settings);
+        assert_eq!(vault_value(&root), before_vault);
+        assert!(!root.join("settings.json").exists());
         assert!(!root.join("vault.dpapi").exists());
+        cleanup(root);
+    }
+    #[test]
+    fn import_uses_authoritative_database_instead_of_stale_legacy_settings() {
+        let root = scratch("database-authority");
+        let legacy =
+            br#"{"bookmarks":[{"title":"Legacy bookmark","url":"https://legacy.example/"}]}"#;
+        fs::write(root.join("settings.json"), legacy).unwrap();
+        let mut settings = storage::read_settings(&root).unwrap();
+        settings.bookmarks.push(Entry {
+            title: "Saved after migration".into(),
+            url: "https://current.example/".into(),
+            ..Default::default()
+        });
+        storage::write_settings(&root, &settings).unwrap();
+        let input = root.join("export.json");
+        fs::write(
+            &input,
+            r#"{"bookmarks":[{"title":"Imported","url":"https://incoming.example/"}]}"#,
+        )
+        .unwrap();
+        let report = import(&root, &input, None).unwrap();
+        assert_eq!(report.bookmarks_added, 1);
+        let settings = storage::read_settings(&root).unwrap();
+        assert_eq!(settings.bookmarks.len(), 3);
+        assert!(settings
+            .bookmarks
+            .iter()
+            .any(|entry| entry.url == "https://current.example/"));
+        assert!(settings
+            .bookmarks
+            .iter()
+            .any(|entry| entry.url == "https://incoming.example/"));
+        assert_eq!(fs::read(root.join("settings.json")).unwrap(), legacy);
+        let backup = PathBuf::from(report.backup_directory.unwrap());
+        let saved_before_import: Settings =
+            serde_json::from_slice(&fs::read(backup.join("settings.json")).unwrap()).unwrap();
+        assert_eq!(saved_before_import.bookmarks.len(), 2);
+        assert!(saved_before_import
+            .bookmarks
+            .iter()
+            .any(|entry| entry.url == "https://current.example/"));
         cleanup(root);
     }
     #[test]
@@ -438,7 +509,7 @@ mod tests {
             label: None,
         });
         storage::write_vault(&root, &vault).unwrap();
-        let old_bytes = fs::read(root.join("vault.dpapi")).unwrap();
+        let old_vault = vault_value(&root);
         fs::write(&csv,"url,username,password\nhttps://existing.example/login,alice,new-test-value\nhttps://new.example/login,bob,other-test-value\nhttp://legacy.example/login,legacy,not-imported\n").unwrap();
         let report = import(&root, &input, Some(&csv)).unwrap();
         assert_eq!(report.logins_added, 2);
@@ -457,39 +528,40 @@ mod tests {
             "new-test-value"
         );
         assert_eq!(
-            fs::read(PathBuf::from(report.backup_directory.unwrap()).join("vault.dpapi")).unwrap(),
-            old_bytes
+            backup_vault_value(Path::new(&report.backup_directory.unwrap())),
+            old_vault
         );
-        let encrypted = fs::read(root.join("vault.dpapi")).unwrap();
+        let encrypted = fs::read(root.join("yas.redb")).unwrap();
         assert!(!String::from_utf8_lossy(&encrypted).contains("new-test-value"));
         cleanup(root);
     }
     #[cfg(windows)]
     #[test]
-    #[expect(
-        clippy::permissions_set_readonly_false,
-        reason = "Windows-only test restores FILE_ATTRIBUTE_READONLY on its own fixture without changing ACLs."
-    )]
-    fn settings_write_failure_rolls_back_already_written_vault() {
+    fn failed_import_transaction_preserves_both_settings_and_vault() {
         let root = scratch("rollback");
         let input = root.join("export.json");
-        let settings = root.join("settings.json");
-        let vault = root.join("vault.dpapi");
         storage::write_settings(&root, &Settings::default()).unwrap();
         storage::write_vault(&root, &Vault::default()).unwrap();
-        let before_settings = fs::read(&settings).unwrap();
-        let before_vault = fs::read(&vault).unwrap();
+        let before_settings = settings_value(&root);
+        let before_vault = vault_value(&root);
         fs::write(&input,r#"{"bookmarks":[{"url":"https://new.example/"}],"addresses":[{"name":"New address"}]}"#).unwrap();
-        let mut permissions = fs::metadata(&settings).unwrap().permissions();
-        permissions.set_readonly(true);
-        fs::set_permissions(&settings, permissions).unwrap();
+        storage::fail_next_transaction_for_test(&root);
         let result = import(&root, &input, None);
-        let mut permissions = fs::metadata(&settings).unwrap().permissions();
-        permissions.set_readonly(false);
-        fs::set_permissions(&settings, permissions).unwrap();
         assert!(result.is_err());
-        assert_eq!(fs::read(&settings).unwrap(), before_settings);
-        assert_eq!(fs::read(&vault).unwrap(), before_vault);
+        assert_eq!(settings_value(&root), before_settings);
+        assert_eq!(vault_value(&root), before_vault);
+        let backups: Vec<_> = fs::read_dir(root.join("import-backups"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(backups.len(), 1);
+        let backup_settings: Settings =
+            serde_json::from_slice(&fs::read(backups[0].join("settings.json")).unwrap()).unwrap();
+        assert_eq!(
+            serde_json::to_value(backup_settings).unwrap(),
+            before_settings
+        );
+        assert_eq!(backup_vault_value(&backups[0]), before_vault);
         cleanup(root);
     }
     #[test]
@@ -505,7 +577,7 @@ mod tests {
         assert_eq!(vault.form_entries.len(), 2);
         assert_eq!(vault.form_entries[0].count, 9);
         assert_eq!(vault.form_entries[1].value, "  preserve spaces  ");
-        let encrypted = fs::read(root.join("vault.dpapi")).unwrap();
+        let encrypted = fs::read(root.join("yas.redb")).unwrap();
         assert!(!String::from_utf8_lossy(&encrypted).contains("synthetic@example.invalid"));
         let again = import(&root, &input, None).unwrap();
         assert_eq!(again.form_entries_added, 0);
@@ -526,6 +598,38 @@ mod tests {
         assert_eq!(settings.bookmarks[1].folder.as_deref(), Some("Personal"));
         assert_eq!(import(&root, &input, None).unwrap().bookmarks_added, 0);
         assert_eq!(storage::read_settings(&root).unwrap().bookmarks.len(), 2);
+        cleanup(root);
+    }
+    #[test]
+    fn chrome_edge_bookmarks_preserve_nested_unicode_folders_and_merge_idempotently() {
+        let root = scratch("chromium-bookmarks");
+        let input = root.join("Bookmarks");
+        fs::write(&input,serde_json::to_vec(&serde_json::json!({"version":1,"roots":{"bookmark_bar":{"type":"folder","name":"Bookmarks bar","children":[{"type":"folder","name":"دبي","children":[{"type":"url","name":"A & B","url":"https://example.org/?a=1&b=2"}]}]},"other":{"type":"folder","name":"Other","children":[{"type":"url","name":"Second copy","url":"https://example.org/?a=1&b=2"}]}}})).unwrap()).unwrap();
+        assert_eq!(import(&root, &input, None).unwrap().bookmarks_added, 2);
+        let saved = storage::read_settings(&root).unwrap();
+        assert!(saved
+            .bookmarks
+            .iter()
+            .any(|b| b.title == "A & B" && b.folder.as_deref() == Some("Bookmarks bar/دبي")));
+        assert_eq!(import(&root, &input, None).unwrap().bookmarks_added, 0);
+        assert_eq!(storage::read_settings(&root).unwrap().bookmarks.len(), 2);
+        cleanup(root);
+    }
+    #[test]
+    fn malformed_native_bookmarks_abort_without_changing_existing_data() {
+        let root = scratch("chromium-malformed");
+        let input = root.join("Bookmarks");
+        let before = storage::read_settings(&root).unwrap();
+        fs::write(
+            &input,
+            br#"{"roots":{"other":{"type":"folder","children":[{"type":"url"}]}}}"#,
+        )
+        .unwrap();
+        assert!(import(&root, &input, None).is_err());
+        assert_eq!(
+            serde_json::to_value(storage::read_settings(&root).unwrap()).unwrap(),
+            serde_json::to_value(before).unwrap()
+        );
         cleanup(root);
     }
 }

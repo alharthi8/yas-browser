@@ -1,74 +1,154 @@
-name: Signed Windows release
+name: Reviewed Windows update release
 on:
-  push:
-    tags: ['v*']
   workflow_dispatch:
+    inputs:
+      version:
+        description: Version of the tested draft installer, such as 0.4.9
+        required: true
+        type: string
+      publish:
+        description: Publish the verified draft as the latest Windows release
+        required: true
+        type: boolean
+        default: false
 permissions:
-  contents: write
+  contents: read
 concurrency:
   group: windows-release
   cancel-in-progress: false
+env:
+  GIT_CONFIG_COUNT: '1'
+  GIT_CONFIG_KEY_0: core.autocrlf
+  GIT_CONFIG_VALUE_0: 'false'
 jobs:
-  release:
+  verify:
+    if: github.repository == 'alharthi8/yas-browser' && github.ref == 'refs/heads/main'
     runs-on: windows-latest
+    permissions:
+      contents: write
+    outputs:
+      version: ${{ steps.verify.outputs.version }}
+      installer_sha: ${{ steps.verify.outputs.installer_sha }}
+      release_sha: ${{ steps.verify.outputs.release_sha }}
+      receipt_sha: ${{ steps.verify.outputs.receipt_sha }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          workspaces: '. -> target'
-      - uses: actions/setup-node@v4
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+        with:
+          toolchain: 1.99.1
+          components: clippy,rustfmt
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: '24'
-      - name: Validate release version
-        shell: pwsh
-        run: |
-          $version = (Select-String -Path 'Cargo.toml' -Pattern '^version = "([^"]+)"' | Select-Object -First 1).Matches.Groups[1].Value
-          if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -ne "v$version") { throw 'Tag must match Cargo version' }
-          "YAS_RELEASE_VERSION=$version" >> $env:GITHUB_ENV
-      - name: Build and test browser
-        shell: pwsh
-        run: |
-          ./build.ps1 -Test -Release
-          ./build.ps1 -Release
-          choco install innosetup --yes --no-progress
-          $compiler = (Get-ChildItem 'C:/Program Files (x86)/Inno Setup*/ISCC.exe' | Select-Object -First 1).FullName
-          Copy-Item target/release/yas.exe Yas.exe
-          ./package.ps1 -Executable ./Yas.exe -Version $env:YAS_RELEASE_VERSION -Compiler $compiler -OutputDirectory ./release-output
-      - name: Install pinned signing tool
-        run: cargo install zipsign --version 0.2.2 --locked --debug
-      - name: Sign and verify update; stage release
+      - name: Verify exact reviewed installer and source; repeat quality tests
+        id: verify
         shell: pwsh
         env:
-          YAS_UPDATE_SIGNING_KEY: ${{ secrets.YAS_UPDATE_SIGNING_KEY }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: ./tools/verify-release-job.ps1 -Version $env:RELEASE_VERSION
+      - name: Retain the public verification receipt in the draft
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ steps.verify.outputs.version }}
+        run: |
+          $draft = gh release view "v$env:RELEASE_VERSION" --repo alharthi8/yas-browser --json isDraft | ConvertFrom-Json
+          if (!$draft.isDraft) { throw 'Target is no longer a draft' }
+          gh release upload "v$env:RELEASE_VERSION" "$env:YAS_CI_RECEIPT" --repo alharthi8/yas-browser --clobber
+          if ($LASTEXITCODE -ne 0) { throw 'Verification receipt upload failed' }
+  sign:
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      RELEASE_VERSION: ${{ needs.verify.outputs.version }}
+      EXPECTED_RECEIPT_SHA: ${{ needs.verify.outputs.receipt_sha }}
+      EXPECTED_INSTALLER_SHA: ${{ needs.verify.outputs.installer_sha }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '24'
+      - name: Download only the already-verified public inputs
+        env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $ErrorActionPreference = 'Stop'
-          $version = (Select-String -Path 'Cargo.toml' -Pattern '^version = "([^"]+)"' | Select-Object -First 1).Matches.Groups[1].Value
-          $asset = 'yas-browser-ota-' + $version + '-x86_64-pc-windows-msvc.zip'
-          $staging = Join-Path $env:RUNNER_TEMP 'ota-stage'
-          New-Item -ItemType Directory -Path $staging | Out-Null
-          Copy-Item 'target/release/yas.exe' (Join-Path $staging 'yas.exe')
-          Compress-Archive -Path (Join-Path $staging 'yas.exe') -DestinationPath $asset
-          $key = Join-Path $env:RUNNER_TEMP 'yas-signing.key'
-          try {
-            [IO.File]::WriteAllBytes($key,[Convert]::FromBase64String($env:YAS_UPDATE_SIGNING_KEY))
-            zipsign sign zip $asset $key
-            if ($LASTEXITCODE -ne 0) { throw 'Signing failed' }
-            zipsign verify zip $asset release.pub
-            if ($LASTEXITCODE -ne 0) { throw 'Signature verification failed' }
-            $verify = Start-Process 'target/release/yas.exe' -ArgumentList @('--yas-verify-update', $asset) -WindowStyle Hidden -Wait -PassThru
-            if ($verify.ExitCode -ne 0) { throw 'App rejected its signed update' }
-            $bad = Join-Path $env:RUNNER_TEMP $asset
-            $bytes = [IO.File]::ReadAllBytes((Resolve-Path $asset))
-            $bytes[0] = $bytes[0] -bxor 1
-            [IO.File]::WriteAllBytes($bad,$bytes)
-            $reject = Start-Process 'target/release/yas.exe' -ArgumentList @('--yas-verify-update', $bad) -WindowStyle Hidden -Wait -PassThru
-            if ($reject.ExitCode -eq 0) { throw 'App accepted a corrupted update' }
-          } finally { if (Test-Path $key) { Remove-Item -LiteralPath $key } }
-          $installer = (Get-ChildItem 'release-output/*Setup*.exe' | Select-Object -First 1).FullName
-          if (!$installer) { throw 'Bootstrap installer was not produced' }
-          gh release create "v$version" $asset $installer --target "$env:GITHUB_SHA" --draft --title 'yas-browser signed-update preview' --notes 'Windows preview with signed in-app updates. Install this bootstrap release once. Later updates are available from Settings > Check for app updates. Quit and reopen when convenient after applying an update. OS publisher signing is not configured. macOS is not available yet.'
-          if ($LASTEXITCODE -ne 0) { throw 'Draft release upload failed' }
-          gh release edit "v$version" --draft=false --latest
+          gh release download "v$RELEASE_VERSION" --repo alharthi8/yas-browser --pattern ci-verified.json --pattern "Yas-$RELEASE_VERSION-Setup-x64.exe" --dir "$RUNNER_TEMP/reviewed"
+          node --input-type=module <<'JS'
+          import fs from 'node:fs';import crypto from 'node:crypto';
+          const root=process.env.RUNNER_TEMP+'/reviewed/',version=process.env.RELEASE_VERSION;
+          const hash=file=>crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex').toUpperCase();
+          if(!/^\d+\.\d+\.\d+$/.test(version)||hash(root+'ci-verified.json')!==process.env.EXPECTED_RECEIPT_SHA||hash(root+'Yas-'+version+'-Setup-x64.exe')!==process.env.EXPECTED_INSTALLER_SHA)throw Error('Verified inputs changed');
+          const receipt=JSON.parse(fs.readFileSync(root+'ci-verified.json','utf8').replace(/^\uFEFF/,''));
+          if(receipt.sourceCommit!==process.env.GITHUB_SHA||receipt.version!==version)throw Error('Source or version changed');
+          for(const [name,data]of [['QUALITY_GATE_RESULTS.json',receipt.quality],['RELEASE_BUILD.json',receipt.build],['PACKAGE_AUDIT_RESULTS.json',receipt.packageAudit]])fs.writeFileSync(name,JSON.stringify(data));
+          JS
+      # This fresh job never runs the installer or browser. The private key is
+      # provided only to this one reviewed signing step, never the test runners.
+      - name: Sign metadata with the existing release identity
+        env:
+          YAS_UPDATE_SIGNING_KEY: ${{ secrets.YAS_UPDATE_SIGNING_KEY }}
+        run: |
+          node tools/publish-update.mjs --prepare --version "$RELEASE_VERSION" --installer "$RUNNER_TEMP/reviewed/Yas-$RELEASE_VERSION-Setup-x64.exe" --output "$RUNNER_TEMP/signed"
+      - name: Attach the signed feed to the existing draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          test "$(gh release view "v$RELEASE_VERSION" --repo alharthi8/yas-browser --json isDraft --jq .isDraft)" = true
+          gh release upload "v$RELEASE_VERSION" "$RUNNER_TEMP/signed/yas-windows-stable.json" --repo alharthi8/yas-browser --clobber
+  verify_signature_and_publish:
+    needs: [verify, sign]
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    env:
+      RELEASE_VERSION: ${{ needs.verify.outputs.version }}
+      EXPECTED_INSTALLER_SHA: ${{ needs.verify.outputs.installer_sha }}
+      EXPECTED_RELEASE_SHA: ${{ needs.verify.outputs.release_sha }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Verify the actual browser accepts the signature and rejects tampering
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP ('yas-signature-'+[guid]::NewGuid().ToString('N'))
+          gh release download "v$env:RELEASE_VERSION" --repo alharthi8/yas-browser --pattern "Yas-$env:RELEASE_VERSION-Setup-x64.exe" --pattern yas-windows-stable.json --dir $root
+          if ($LASTEXITCODE -ne 0) { throw 'Signature-test download failed' }
+          Remove-Item Env:GH_TOKEN
+          $installer = Join-Path $root "Yas-$env:RELEASE_VERSION-Setup-x64.exe"
+          if ((Get-FileHash -LiteralPath $installer).Hash -ne $env:EXPECTED_INSTALLER_SHA) { throw 'Installer changed' }
+          if (Test-Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\{E290A0CE-DB17-4BD2-9724-90AB04BC61F7}_is1') { throw 'Unexpected runner installation' }
+          $installed = Join-Path $root installed
+          $process = Start-Process $installer -ArgumentList @('/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/SP-',('/DIR="'+$installed+'"')) -WindowStyle Hidden -PassThru
+          $null=$process.Handle;$process.WaitForExit();if($process.ExitCode -ne 0){throw 'Signature-test installation failed'}
+          $exe = Join-Path $installed Yas.exe
+          if ((Get-FileHash -LiteralPath $exe).Hash -ne $env:EXPECTED_RELEASE_SHA) { throw 'Executable changed' }
+          $feed = Join-Path $root yas-windows-stable.json
+          $process = Start-Process $exe -ArgumentList @('--yas-verify-update-feed',('"'+$feed+'"')) -WindowStyle Hidden -PassThru
+          $null=$process.Handle;$process.WaitForExit();if($process.ExitCode -ne 0){throw 'Browser rejected its signed feed'}
+          $data = Get-Content -LiteralPath $feed -Raw | ConvertFrom-Json
+          $signature = [Convert]::FromBase64String($data.signature);$signature[0] = $signature[0] -bxor 1
+          $data.signature = [Convert]::ToBase64String($signature)
+          $bad = Join-Path $root tampered.json
+          $data | ConvertTo-Json | Set-Content -LiteralPath $bad -Encoding utf8NoBOM
+          $process = Start-Process $exe -ArgumentList @('--yas-verify-update-feed',('"'+$bad+'"')) -WindowStyle Hidden -PassThru
+          $null=$process.Handle;$process.WaitForExit();if($process.ExitCode -eq 0){throw 'Browser accepted altered metadata'}
+      - name: Publish only when the maintainer explicitly requests publication
+        if: inputs.publish
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $draft = gh release view "v$env:RELEASE_VERSION" --repo alharthi8/yas-browser --json isDraft | ConvertFrom-Json
+          if (!$draft.isDraft) { throw 'Target is no longer a draft' }
+          gh release edit "v$env:RELEASE_VERSION" --repo alharthi8/yas-browser --draft=false --latest --target "$env:GITHUB_SHA"
           if ($LASTEXITCODE -ne 0) { throw 'Release publication failed' }

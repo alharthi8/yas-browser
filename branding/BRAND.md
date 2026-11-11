@@ -1,8 +1,8 @@
-# Yas
+# Yas Browser
 
 **A clearer view of the web.**
 
-Yas is a modern blue browser identity inspired by the UAE's tradition of falconry. Its original **Falcon Wing** symbol combines a white falcon silhouette, a closed hooked beak, a swept wing, and a sky-blue rear feather on a rounded royal-blue tile. The open feather detail, angled eye, and cheek marking give it a clear silhouette at small sizes. It contains no letter monogram, official insignia, or borrowed government or airline emblem.
+Yas Browser is a modern blue browser identity inspired by the UAE's tradition of falconry. Its original **Falcon Wing** symbol combines a white falcon silhouette, a closed hooked beak, a swept wing, and a sky-blue rear feather on a rounded royal-blue tile. The open feather detail, angled eye, and cheek marking give it a clear silhouette at small sizes. It contains no letter monogram, official insignia, or borrowed government or airline emblem.
 
 ## Visual identity
 

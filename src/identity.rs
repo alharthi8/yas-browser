@@ -149,7 +149,13 @@ impl Drop for StagingDirectory {
 }
 
 fn verify_key_files(previous: &Path, staged: &Path) -> Result<(), String> {
-    for name in ["settings.json", "vault.dpapi"] {
+    for name in [
+        "settings.json",
+        "vault.dpapi",
+        "downloads.dpapi",
+        "yas.redb",
+        "yas.storage-version",
+    ] {
         let source = previous.join(name);
         match fs::read(&source) {
             Ok(before) => {

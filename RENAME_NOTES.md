@@ -1,4 +1,6 @@
-# Yas 0.4.1
+# Yas 0.4.7 — naming and upgrade compatibility
+
+The Yas identity introduced in 0.4.1 remains unchanged. An existing 0.4.6 Yas installation upgrades under the same application identity; its profile stays outside the installation folder. Explicitly exit the background browser before updating. Preserving download history does not preserve live native transfers across process exit.
 
 The browser name is Yas throughout its interface, window title, Windows file metadata, executable, shortcuts, installer, portable package, export filenames, source package, and branding. The original UAE-inspired falcon symbol replaces the previous icon. The interface retains Dubai and the modern blue light/Stealth themes.
 

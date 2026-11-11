@@ -26,18 +26,21 @@ $version = $versionMatch.Groups[1].Value
 
 function Get-SourceFingerprint {
     $files = @()
-    foreach ($name in @('Cargo.toml','Cargo.lock','build.ps1','package.ps1','quality.ps1','README.md','RELEASE_NOTES.md','RENAME_NOTES.md','THIRD_PARTY.md','installer\Yas.iss')) {
+    foreach ($name in @('Cargo.toml','Cargo.lock','build.ps1','package.ps1','quality.ps1','README.md','RELEASE_NOTES.md','RENAME_NOTES.md','THIRD_PARTY.md','UPDATES.md','release.pub','installer\Yas.iss','installer\README.md','ai-runtime\AI_RUNTIME_MANIFEST.json')) {
         $path = Join-Path $PSScriptRoot $name
         if (Test-Path -LiteralPath $path -PathType Leaf) { $files += Get-Item -LiteralPath $path }
     }
-    foreach ($name in @('src','branding','filters')) {
+    foreach ($name in @('src','branding','filters','assistant','tools','.github')) {
         $path = Join-Path $PSScriptRoot $name
         if (Test-Path -LiteralPath $path) { $files += Get-ChildItem -LiteralPath $path -File -Recurse }
     }
-    $records = @($files | Sort-Object FullName -Unique | ForEach-Object {
+    $records = [string[]]@($files | Sort-Object FullName -Unique | ForEach-Object {
         $relative = $_.FullName.Substring($PSScriptRoot.Length + 1).Replace('\','/')
         $relative + ' ' + (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash
     })
+    # Windows PowerShell and PowerShell 7 use different culture collation.
+    # Release fingerprints must agree across both hosts.
+    [Array]::Sort($records, [StringComparer]::Ordinal)
     $bytes = [Text.Encoding]::UTF8.GetBytes(($records -join "`n"))
     $hasher = [Security.Cryptography.SHA256]::Create()
     try { $hash = ([BitConverter]::ToString($hasher.ComputeHash($bytes))).Replace('-','') }
@@ -65,7 +68,11 @@ function Invoke-GateCommand([string]$Name, [string]$File, [string[]]$Arguments, 
     $stderr = Join-Path $EvidenceDirectory ($Name + '.stderr.log')
     $started = Get-Date
     try {
-        $process = Start-Process -FilePath $File -ArgumentList $Arguments -WorkingDirectory $WorkingDirectory -RedirectStandardOutput $stdout -RedirectStandardError $stderr -WindowStyle Hidden -Wait -PassThru
+        $process = Start-Process -FilePath $File -ArgumentList $Arguments -WorkingDirectory $WorkingDirectory -RedirectStandardOutput $stdout -RedirectStandardError $stderr -WindowStyle Hidden -PassThru
+        # Wait for the compiler/test command itself. Start-Process -Wait follows
+        # descendant jobs and can hang after Cargo and every test have exited.
+        $null = $process.Handle
+        $process.WaitForExit()
         return [ordered]@{passed=($process.ExitCode -eq 0);exitCode=$process.ExitCode;seconds=[math]::Round(((Get-Date)-$started).TotalSeconds,3);stdout=[IO.Path]::GetFileName($stdout);stderr=[IO.Path]::GetFileName($stderr)}
     } catch {
         $_ | Out-String | Set-Content -LiteralPath $stderr -Encoding utf8
