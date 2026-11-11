@@ -1,0 +1,12 @@
+SeaHash 4.1.0 attribution
+
+The checksum-verified published crate declares MIT licensing and lists:
+  ticki <ticki@users.noreply.github.com>
+  Tom Almeida <tom@tommoa.me>
+
+Repository: https://gitlab.redox-os.org/redox-os/seahash
+Published VCS revision: 94b632aeac099031c373599313d5b5f0acbbaec0
+
+The published crate and root tree at that revision contain no standalone LICENSE file.
+SPDX-MIT.txt is the unmodified SPDX MIT template, not an invented upstream copyright notice.
+UPSTREAM-CARGO-TOML.txt preserves the original authorship and license declaration.
