@@ -46,17 +46,44 @@ pub struct Record {
 struct Running {
     tab_id: usize,
     op: ICoreWebView2DownloadOperation,
-    tab_counter: Rc<Cell<usize>>,
+    tab_lease: TabLease,
     meter: ProgressMeter,
     tokens: Option<(i64, i64)>,
     // Keep native owners alive across resumed DownloadStarting operations.
     owners: Vec<ICoreWebView2DownloadOperation>,
     cancel_requested: bool,
 }
-impl Drop for Running {
+// Cancellation tombstones may outlive a transfer to reject a late handoff.
+// Only a live transfer needs to keep the source WebView resident.
+struct TabLease {
+    counter: Rc<Cell<usize>>,
+    held: bool,
+}
+impl TabLease {
+    fn new(counter: Rc<Cell<usize>>) -> Self {
+        let mut lease = Self {
+            counter,
+            held: false,
+        };
+        lease.acquire();
+        lease
+    }
+    fn acquire(&mut self) {
+        if !self.held {
+            self.counter.set(self.counter.get() + 1);
+            self.held = true;
+        }
+    }
+    fn release(&mut self) {
+        if self.held {
+            self.counter.set(self.counter.get().saturating_sub(1));
+            self.held = false;
+        }
+    }
+}
+impl Drop for TabLease {
     fn drop(&mut self) {
-        self.tab_counter
-            .set(self.tab_counter.get().saturating_sub(1));
+        self.release();
     }
 }
 struct Pending {
@@ -877,6 +904,11 @@ fn sync_status(manager: &Shared, id: usize, native: NativeStatus, force: bool) -
             }
         }
     }
+    if status == "cancelled" {
+        if let Some(job) = m.running.get_mut(&id) {
+            job.tab_lease.release();
+        }
+    }
     let released = if !choosing && !keep {
         m.running.remove(&id)
     } else {
@@ -1196,7 +1228,6 @@ pub fn attach(
                         if !private {
                             m.next_regular = id;
                         }
-                        tab_counter.set(tab_counter.get() + 1);
                         m.records.push(Record {
                             id,
                             url,
@@ -1222,7 +1253,7 @@ pub fn attach(
                             Running {
                                 tab_id,
                                 op: op.clone(),
-                                tab_counter: tab_counter.clone(),
+                                tab_lease: TabLease::new(tab_counter.clone()),
                                 meter: ProgressMeter::new(),
                                 tokens: None,
                                 owners: Vec::new(),
@@ -1557,6 +1588,7 @@ pub fn cancel(manager: &Shared, id: usize) -> Result<(), String> {
                 let mut m = manager.borrow_mut();
                 if let Some(job) = m.running.get_mut(&id) {
                     job.cancel_requested = false;
+                    job.tab_lease.acquire();
                 }
                 if let Some(record) = m
                     .records
@@ -1640,6 +1672,24 @@ pub fn cancel_tab(manager: &Shared, tab_id: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cancelled_tombstone_releases_tab_once_and_failed_cancel_can_reacquire() {
+        let counter = Rc::new(Cell::new(0));
+        let mut cancelled = TabLease::new(counter.clone());
+        let other = TabLease::new(counter.clone());
+        assert_eq!(counter.get(), 2);
+        cancelled.release();
+        cancelled.release();
+        assert_eq!(counter.get(), 1);
+        cancelled.acquire();
+        cancelled.acquire();
+        assert_eq!(counter.get(), 2);
+        cancelled.release();
+        drop(cancelled);
+        assert_eq!(counter.get(), 1);
+        drop(other);
+        assert_eq!(counter.get(), 0);
+    }
     use std::{
         fs,
         sync::atomic::{AtomicU64, Ordering},
