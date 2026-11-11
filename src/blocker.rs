@@ -11,6 +11,24 @@ use webview2_com::{
 use windows::core::{Interface, HSTRING, PWSTR};
 use wry::{WebView, WebViewExtWindows};
 
+#[path = "filter_cache.rs"]
+mod filter_cache;
+
+const GENERIC_SCAN_JS: &str = r#"(()=>{
+    const cap=20000,classes=new Set(),ids=[];
+    for(const element of document.querySelectorAll('[class],[id]')){
+        if(classes.size<cap&&element.hasAttribute('class')){
+            for(const name of element.classList){
+                classes.add(name);
+                if(classes.size===cap)break;
+            }
+        }
+        if(ids.length<cap&&element.hasAttribute('id'))ids.push(element.id);
+        if(classes.size===cap&&ids.length===cap)break;
+    }
+    return JSON.stringify({classes:[...classes],ids});
+})()"#;
+
 pub const SOURCES: [(&str, &str); 2] = [
     ("easylist.txt", "https://easylist.to/easylist/easylist.txt"),
     (
@@ -19,8 +37,34 @@ pub const SOURCES: [(&str, &str); 2] = [
     ),
 ];
 const FALLBACK: &str = "||doubleclick.net^\n||googlesyndication.com^\n||google-analytics.com^\n||googletagmanager.com^\n||adnxs.com^\n||connect.facebook.net^$third-party\n||adsystem.com^\n";
+fn source_host(source: &str) -> Option<String> {
+    url::Url::parse(source)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+}
+
+// Each website view owns its last parsed source. Policy is deliberately read
+// afresh: toggling an exception or replacing Shield must take effect at once.
+#[derive(Default)]
+struct SourceHostCache {
+    source: Option<String>,
+    host: Option<String>,
+}
+impl SourceHostCache {
+    fn enabled(&mut self, source: &str, exceptions: &[String]) -> bool {
+        if self.source.as_deref() != Some(source) {
+            self.host = source_host(source);
+            self.source = Some(source.to_owned());
+        }
+        self.host
+            .as_ref()
+            .is_some_and(|host| !exceptions.contains(host))
+    }
+}
+
 pub struct Shield {
     pub engine: Engine,
+    pub bundled_cache_used: bool,
     pub exceptions: Vec<String>,
     pub count: usize,
     pub rules: usize,
@@ -45,18 +89,17 @@ impl Shield {
             .lines()
             .filter(|l| !l.is_empty() && !l.starts_with('!') && !l.starts_with('['))
             .count();
+        let (engine, bundled_cache_used) = filter_cache::build(lists);
         Self {
-            engine: Engine::new_with_list_text(lists),
+            engine,
+            bundled_cache_used,
             exceptions,
             count: 0,
             rules,
         }
     }
     pub fn enabled(&self, source: &str) -> bool {
-        url::Url::parse(source)
-            .ok()
-            .and_then(|u| u.host_str().map(str::to_owned))
-            .is_some_and(|h| !self.exceptions.contains(&h))
+        source_host(source).is_some_and(|h| !self.exceptions.contains(&h))
     }
 }
 pub fn attach(
@@ -81,12 +124,16 @@ pub fn attach(
             )?;
         }
         let mut token = 0;
+        let source_cache = RefCell::new(SourceHostCache::default());
         web.add_WebResourceRequested(
             &WebResourceRequestedEventHandler::create(Box::new(move |_, args| {
                 let Some(args) = args else { return Ok(()) };
                 let source = source.borrow();
                 let mut shield = shield.borrow_mut();
-                if !shield.enabled(&source) {
+                let enabled = source_cache
+                    .borrow_mut()
+                    .enabled(&source, &shield.exceptions);
+                if !enabled {
                     return Ok(());
                 }
                 let request = args.Request()?;
@@ -154,7 +201,7 @@ pub fn cosmetic(view: &WebView, shield: Rc<RefCell<Shield>>, url: String) {
         let web = view.webview();
         let callback_view = web.clone();
         unsafe {
-            let _=web.ExecuteScript(&HSTRING::from("JSON.stringify({classes:[...new Set([...document.querySelectorAll('[class]')].flatMap(e=>[...e.classList]))].slice(0,20000),ids:[...document.querySelectorAll('[id]')].map(e=>e.id).slice(0,20000)})"), &webview2_com::ExecuteScriptCompletedHandler::create(Box::new(move |hr,result| {
+            let _=web.ExecuteScript(&HSTRING::from(GENERIC_SCAN_JS), &webview2_com::ExecuteScriptCompletedHandler::create(Box::new(move |hr,result| {
             if hr.is_err() { return Ok(()); }
             let raw=serde_json::from_str::<String>(&result).unwrap_or_default();
             if let Ok(v)=serde_json::from_str::<serde_json::Value>(&raw) {
@@ -173,6 +220,84 @@ pub fn cosmetic(view: &WebView, shield: Rc<RefCell<Shield>>, url: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn test_shield(filters: &str, exceptions: Vec<String>) -> Shield {
+        Shield {
+            engine: Engine::new_with_list_text(filters.to_owned()),
+            bundled_cache_used: false,
+            exceptions,
+            count: 0,
+            rules: filters.lines().count(),
+        }
+    }
+
+    #[test]
+    fn source_host_cache_matches_uncached_policy_across_source_changes() {
+        let shield = test_shield("", vec!["example.test".into(), "[::1]".into()]);
+        let mut cache = SourceHostCache::default();
+        for source in [
+            "https://EXAMPLE.test:8443/path?q=1#part",
+            "https://sub.example.test/path",
+            "https://sub.example.test/other?q=2",
+            "http://localhost:9397/",
+            "http://127.0.0.1:9397/",
+            "http://[::1]:9397/",
+            "https://bücher.example/",
+            "https://user:password@example.test/",
+            "about:blank",
+            "data:text/plain,fixture",
+            "not a URL",
+            "",
+            "https://sub.example.test/path",
+        ] {
+            for _ in 0..2 {
+                assert_eq!(
+                    cache.enabled(source, &shield.exceptions),
+                    shield.enabled(source)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn source_host_cache_observes_exception_toggles_and_replacements_immediately() {
+        let source = "https://example.test/path";
+        let mut cache = SourceHostCache::default();
+        let mut shield = test_shield("", Vec::new());
+        assert!(cache.enabled(source, &shield.exceptions));
+        shield.exceptions.push("example.test".into());
+        assert!(!cache.enabled(source, &shield.exceptions));
+        shield.exceptions.clear();
+        assert!(cache.enabled(source, &shield.exceptions));
+        shield.exceptions = vec!["other.test".into(), "example.test".into()];
+        assert!(!cache.enabled(source, &shield.exceptions));
+        shield.exceptions = vec!["other.test".into()];
+        assert!(cache.enabled(source, &shield.exceptions));
+        assert_eq!(
+            cache.enabled(source, &shield.exceptions),
+            shield.enabled(source)
+        );
+    }
+
+    #[test]
+    fn source_host_cache_does_not_cache_filter_decisions_or_configuration_rebuilds() {
+        let source = "https://news.test/";
+        let request = Request::new("https://ads.test/ad.js", source, "script", "GET").unwrap();
+        let mut cache = SourceHostCache::default();
+        let mut shield = test_shield("||ads.test^\n", Vec::new());
+        assert!(cache.enabled(source, &shield.exceptions));
+        assert!(shield.engine.check_network_request(&request).should_block());
+
+        shield = test_shield("||ads.test^\n@@||ads.test/ad.js$script\n", Vec::new());
+        assert!(cache.enabled(source, &shield.exceptions));
+        assert!(!shield.engine.check_network_request(&request).should_block());
+
+        shield = test_shield("||ads.test^\n", vec!["news.test".into()]);
+        assert!(!cache.enabled(source, &shield.exceptions));
+        shield = test_shield("||ads.test^\n", Vec::new());
+        assert!(cache.enabled(source, &shield.exceptions));
+        assert!(shield.engine.check_network_request(&request).should_block());
+    }
+
     #[test]
     fn blocks_and_honors_exception_rules() {
         let engine = Engine::new_with_list_text(

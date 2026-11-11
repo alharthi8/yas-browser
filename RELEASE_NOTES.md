@@ -1,4 +1,38 @@
-# Yas 0.4.5
+# Yas 0.4.9
+
+Application settings, ordered bookmarks and history, saved tab titles, preferences, the encrypted password/autofill vault, and encrypted download records move to the Rust redb database. First migration validates every legacy input, commits a staged database with immediate durability, reopens it and checks full data equality before publishing it. The original settings and encrypted files stay unchanged as recovery inputs. A storage-version marker prevents a missing migrated database from silently reimporting stale data. Existing invalid or unsupported databases stop startup rather than loading empty defaults. Passwords and download details remain Windows DPAPI protected; website-engine cookies and profiles keep their existing format and location.
+
+Appearance preferences offer Light, Dark and System. Searches from the address bar and new-tab page use the selected Bing, Google, DuckDuckGo or Brave Search provider. These preferences are saved in the database.
+
+Local AI provides manual summaries and questions about selected text or a limited page excerpt. The compact distribution includes a local runtime; a separate model download is initiated explicitly through setup. Responses are text, have no browser-action tools, and prompts/answers are not stored in the profile database. The model is loaded on demand and requested to unload after each completed generation. Existing compatible local models can also be used. Download size, setup and engine limits are described by the interface and matching release reports.
+
+Address-bar history suggestions omit temporary sign-in URLs containing account-routing or token parameters. Existing history and explicitly saved bookmarks are retained. The Outlook shortcut continues to use the public Outlook entry; Yas does not select an organization or bypass website sign-in redirects. A clean Stealth diagnostic of the installed previous release reached the standard Microsoft sign-in page; this does not establish successful account authentication.
+
+Only fresh 0.4.9 reports naming its exact executable hash validate this release. Migration, local-AI, preference, compatibility, package and actual-user update checks are separate. Storage API benchmarks do not establish website loading or whole-browser speed gains. Earlier release reports remain historical.
+
+# Previous release: Yas 0.4.8
+
+Sleeping and restored regular tabs keep their last saved page title. Existing URL-only sessions recover names from matching local history or bookmarks, with the website hostname as a fallback. Hovering a tab shows its full title, sleeping status, and address. Pages still load lazily. Stealth tab titles and URLs are excluded from saved sessions. The legacy URL array remains compatible with earlier releases.
+
+This is a focused title-restoration patch. Only fresh reports naming 0.4.8 and its executable hash validate this build. Earlier 0.4.7 reports remain historical; this patch does not establish a new browser speed, RAM, or CPU comparison.
+
+# Previous release: Yas 0.4.7
+
+The normal recent-view budget increases to five ordinary website views. Memory pressure, an unavailable memory reading, or repeated failure to confirm native suspension falls back to two. Unprotected background views still expire after 120 seconds. Playing-audio pages and active or paused download owners are exempt from automatic trimming, expiry, and suspension. Retained views keep live document state; evicted or explicitly sleeping tabs reload and can lose unsaved state. This policy can spend more RAM to avoid reloads, rather than guaranteeing the lowest memory use.
+
+Request filtering reuses a view's top-level host until its document context changes. It continues to apply current rules and site exceptions. An embedded compiled filter engine targets initialization of the exact unchanged bundled snapshots, with metadata/input validation and the normal text fallback for changed, updated, custom, or invalid inputs. Source inclusion does not establish that a particular release used the cache; its matching runtime report must show that branch.
+
+Completion and measurements are recorded only in reports naming version 0.4.7 and the final executable hash. `VIEW_POLICY_TEST_RESULTS.json` must explicitly identify positive five-tab state retention; a fallback run alone does not prove it. Named policy units describe simulated thresholds and failure handling separately from native observations. `OPTIMIZATION_TEST_RESULTS.json`, when completed and scored, records the paired before/after workloads and limits. Pending or historical evidence does not validate this candidate. Isolated initialization microbenchmarks do not establish complete browser startup or a generally faster browser.
+
+# Previous release: Yas 0.4.6
+
+Website notifications now have an Allow/Block prompt and permission controls in Settings. Regular choices are saved locally; Stealth choices stay separate in memory and end with the last Stealth tab. Notifications require a loaded website page. Sleeping or closing its tab, or exiting Yas, stops that page's notifications. Service-worker Web Push is not implemented. Windows notification settings and Do Not Disturb can prevent banners.
+
+Yas now explicitly requests Microsoft Defender SmartScreen website and download reputation checks and confirms the WebView2 setting. Windows security settings can override this request. A successful API readback does not certify actual enforcement; warning-page observations must be reported separately. Yas does not change Windows security settings.
+
+Release-specific reports record automated browsing, autofill, downloads, notification permissions and privacy reset, session restoration, and isolated installer checks for the final executable. The native notification banner was observed; manual banner clicks and dismissal were not verified. A harmless Microsoft phishing demonstration displayed the native SmartScreen unsafe-site warning; this observation does not establish enforcement for every site or download. If PERFORMANCE_TEST_RESULTS.json is present, it records the final Chrome/Edge comparison, matched workloads, exclusions, and limits. Its absence means no completed comparative result is bundled. Measurements apply to this computer and test window and do not establish a universal browser winner. Development microbenchmarks cover isolated download-ledger preparation and cosmetic-selector scans, rather than total-browser performance. Earlier 0.4.5 evidence remains historical.
+
+# Previous release: Yas 0.4.5
 
 This maintenance release protects existing browsing data when saved settings are damaged or unreadable. Startup reports the problem and preserves the file so a verified backup can be restored.
 

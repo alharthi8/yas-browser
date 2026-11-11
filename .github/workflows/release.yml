@@ -3,6 +3,11 @@ on:
   push:
     tags: ['v*']
   workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish the tested Windows release
+        type: boolean
+        default: false
 permissions:
   contents: write
 concurrency:
@@ -20,21 +25,36 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '24'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Restore reviewed CPU runtime
+        uses: actions/cache@v4
+        with:
+          path: ai-runtime
+          key: yas-cpu-runtime-${{ hashFiles('ai-runtime/AI_RUNTIME_MANIFEST.json') }}
+      - name: Verify and assemble pinned CPU runtime
+        run: python scripts/prepare-ai-runtime.py
       - name: Validate release version
         shell: pwsh
         run: |
           $version = (Select-String -Path 'Cargo.toml' -Pattern '^version = "([^"]+)"' | Select-Object -First 1).Matches.Groups[1].Value
           if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -ne "v$version") { throw 'Tag must match Cargo version' }
+          $status=Get-Content -Raw RELEASE_STATUS.json | ConvertFrom-Json
+          if ($status.version -ne $version -or $status.publishAllowed -ne $true) { throw "Release is on hold: $($status.reason)" }
           "YAS_RELEASE_VERSION=$version" >> $env:GITHUB_ENV
       - name: Build and test browser
         shell: pwsh
         run: |
+          ./build.ps1 -GenerateBundledCache -Release
           ./build.ps1 -Test -Release
           ./build.ps1 -Release
           choco install innosetup --yes --no-progress
           $compiler = (Get-ChildItem 'C:/Program Files (x86)/Inno Setup*/ISCC.exe' | Select-Object -First 1).FullName
           Copy-Item target/release/yas.exe Yas.exe
-          ./package.ps1 -Executable ./Yas.exe -Version $env:YAS_RELEASE_VERSION -Compiler $compiler -OutputDirectory ./release-output
+          ./package.ps1 -Executable ./Yas.exe -Version $env:YAS_RELEASE_VERSION -Compiler $compiler -OutputDirectory ./release-output -StagingDirectory (Join-Path $env:RUNNER_TEMP 'yas-package-stage')
+      - name: Launch packaged browser and verify native interaction
+        run: node scripts/native-smoke.mjs target/release/yas.exe
       - name: Install pinned signing tool
         run: cargo install zipsign --version 0.2.2 --locked --debug
       - name: Sign and verify update; stage release
@@ -68,7 +88,22 @@ jobs:
           } finally { if (Test-Path $key) { Remove-Item -LiteralPath $key } }
           $installer = (Get-ChildItem 'release-output/*Setup*.exe' | Select-Object -First 1).FullName
           if (!$installer) { throw 'Bootstrap installer was not produced' }
-          gh release create "v$version" $asset $installer --target "$env:GITHUB_SHA" --draft --title 'yas-browser signed-update preview' --notes 'Windows preview with signed in-app updates. Install this bootstrap release once. Later updates are available from Settings > Check for app updates. Quit and reopen when convenient after applying an update. OS publisher signing is not configured. macOS is not available yet.'
+          Copy-Item $asset release-output/
+          Get-ChildItem release-output/*.exe,release-output/*.zip | ForEach-Object { $hash=(Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant(); "$hash  $($_.Name)" } | Set-Content -Encoding utf8 release-output/SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: yas-browser-windows-release
+          path: release-output/*
+          if-no-files-found: error
+      - name: Publish tested Windows release
+        if: startsWith(github.ref, 'refs/tags/v') || inputs.publish
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $version=$env:YAS_RELEASE_VERSION
+          $assets=@(Get-ChildItem release-output/*.exe,release-output/*.zip,release-output/SHA256SUMS.txt | ForEach-Object FullName)
+          gh release create "v$version" @assets --target "$env:GITHUB_SHA" --draft --title "Yas Browser $version" --notes-file RELEASE_v1.md
           if ($LASTEXITCODE -ne 0) { throw 'Draft release upload failed' }
           gh release edit "v$version" --draft=false --latest
           if ($LASTEXITCODE -ne 0) { throw 'Release publication failed' }

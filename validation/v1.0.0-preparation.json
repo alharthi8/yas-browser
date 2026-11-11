@@ -1,0 +1,18 @@
+{
+  "version": "1.0.0",
+  "status": "held-for-security-analysis",
+  "unitTestsPassed": 135,
+  "formatPassed": true,
+  "strictClippyPassed": true,
+  "sourceFingerprint": {
+    "sha256": "933058DA6165F2743F0560A31C18D6AB2741058F3E1156A49B21B3A945DB634A",
+    "fileCount": 56
+  },
+  "lockSha256": "47BD678A58CF611B0F01C43487B71F7D3A162110EC61777DC5856FC73AF812DC",
+  "nativeSmokePassed": true,
+  "fullRegressionPassed": false,
+  "installerValidated": false,
+  "signedUpdateValidated": false,
+  "published": false,
+  "defenderDetection": "Trojan:Win32/Bearfoos.B!ml"
+}

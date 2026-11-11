@@ -1,0 +1,38 @@
+{
+  "version": "1.0.0",
+  "auditedAt": "2026-11-11T08:20:16.4903362Z",
+  "vulnerabilityCategoryCount": 0,
+  "warnings": [
+    {
+      "category": "unmaintained",
+      "package": "proc-macro-error",
+      "version": "1.0.4",
+      "advisory": "RUSTSEC-2024-0370"
+    },
+    {
+      "category": "unmaintained",
+      "package": "zbus_names",
+      "version": "4.3.5",
+      "advisory": "RUSTSEC-2026-0371"
+    },
+    {
+      "category": "unmaintained",
+      "package": "zvariant",
+      "version": "5.15.1",
+      "advisory": "RUSTSEC-2026-0370"
+    },
+    {
+      "category": "unmaintained",
+      "package": "zvariant_derive",
+      "version": "5.15.1",
+      "advisory": "RUSTSEC-2026-0372"
+    },
+    {
+      "category": "unsound",
+      "package": "glib",
+      "version": "0.18.5",
+      "advisory": "RUSTSEC-2024-0429"
+    }
+  ],
+  "scope": "RustSec dependency advisory audit only; does not resolve Defender malware detection"
+}

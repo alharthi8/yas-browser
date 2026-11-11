@@ -7,3 +7,8 @@ node_modules/
 
 macos/dist/
 macos/src-tauri/gen/
+ai-runtime/**/*.exe
+ai-runtime/**/*.dll
+release-output/
+quality-evidence/
+QUALITY_GATE_RESULTS.json

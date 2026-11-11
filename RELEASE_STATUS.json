@@ -1,0 +1,12 @@
+{
+  "version": "1.0.0",
+  "publishAllowed": false,
+  "status": "held-for-security-analysis",
+  "reason": "Microsoft Defender blocked the compiled Windows candidate as Trojan:Win32/Bearfoos.B!ml. This has not been established as a false positive.",
+  "updatedAt": "2026-11-11",
+  "requiredBeforeRelease": [
+    "Resolve the Defender detection through source/dependency investigation and Microsoft analysis as appropriate.",
+    "Build and scan the final candidate with protection enabled.",
+    "Complete native regression, installer, and signed-update checks on the final candidate."
+  ]
+}

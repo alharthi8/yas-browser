@@ -1,0 +1,8 @@
+{
+  "version": "1.0.0",
+  "baseline": "Windows development 0.4.9",
+  "snapshotAt": "2026-11-11T08:05:24.357Z",
+  "files": 705,
+  "fingerprint": "b591c664fd39e05a8f6206ed789bb00f8bb01afc35f06f1b68389bb468835586",
+  "notes": "Snapshot includes public source and distribution resources only. User profiles, credentials, models and historical test reports are excluded. Version and updater integration are validated separately."
+}

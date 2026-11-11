@@ -1,5 +1,5 @@
 #ifndef AppVersion
-  #define AppVersion "0.4.5"
+  #define AppVersion "1.0.0"
 #endif
 #ifndef AppRoot
   #define AppRoot AddBackslash(SourcePath) + ".."
@@ -13,21 +13,30 @@
 #ifndef BootstrapperSha256
   #error Build with package.ps1 so the Microsoft Bootstrapper signature and hash are verified.
 #endif
+#ifndef AiRuntimeFiles
+  #error Build with package.ps1 so the CPU-only AI runtime inventory, hashes, and license notices are verified.
+#endif
+#ifndef AiRuntimeManifestSha256
+  #error A reviewed AI runtime manifest hash is required.
+#endif
+#if AiRuntimeManifestSha256 != "FE26D105E6D8A9B82DA1AACC652F3EC9509591560FF5EC3807150DD8375FDDC7"
+  #error AI runtime manifest does not match this application release.
+#endif
 
 [Setup]
 AppId={{E290A0CE-DB17-4BD2-9724-90AB04BC61F7}
-AppName=Yas
+AppName=Yas Browser
 AppVersion={#AppVersion}
-AppVerName=Yas {#AppVersion}
-AppPublisher=Yas
-AppCopyright=Yas
+AppVerName=Yas Browser {#AppVersion}
+AppPublisher=Appana Technologies
+AppCopyright=Appana Technologies
 DefaultDirName={localappdata}\Programs\Yas
-DefaultGroupName=Yas
+DefaultGroupName=Yas Browser
 PrivilegesRequired=lowest
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
-MinVersion=10.0.17763
-UninstallDisplayName=Yas
+MinVersion=10.0.19045
+UninstallDisplayName=Yas Browser
 UninstallDisplayIcon={app}\Yas.exe
 UninstallFilesDir={app}\uninstall
 OutputDir={#OutputDir}
@@ -49,7 +58,7 @@ UsePreviousGroup=no
 UsePreviousTasks=yes
 VersionInfoVersion={#AppVersion}.0
 VersionInfoDescription=Yas browser installer
-VersionInfoProductName=Yas
+VersionInfoProductName=Yas Browser
 VersionInfoProductVersion={#AppVersion}
 SetupLogging=yes
 ChangesAssociations=no
@@ -63,8 +72,8 @@ DialogFontName=Dubai
 WelcomeFontName=Dubai
 
 [Messages]
-WelcomeLabel1=Meet Yas.
-WelcomeLabel2=A clearer view of the web.%n%nSetup will install Yas for your Windows account. Your bookmarks, browsing profile, and encrypted vault are stored separately from the application.%n%nMicrosoft Edge WebView2 Runtime is required. Your default browser will not change.
+WelcomeLabel1=Meet Yas Browser.
+WelcomeLabel2=A clearer view of the web.%n%nSetup will install Yas Browser for your Windows account. Your bookmarks, browsing profile, and encrypted vault are stored separately from the application.%n%nMicrosoft Edge WebView2 Runtime is required. Your default browser will not change.
 FinishedLabel=Yas is ready.%n%nYour good side of the web is one click away.
 
 [Tasks]
@@ -81,6 +90,10 @@ Source: "{#AppRoot}\RELEASE_NOTES.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#AppRoot}\THIRD_PARTY.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#AppRoot}\RENAME_NOTES.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#AppRoot}\licenses\*"; DestDir: "{app}\licenses"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#AppRoot}\assistant\*"; DestDir: "{app}\assistant"; Flags: ignoreversion recursesubdirs createallsubdirs
+; package.ps1 copies only the reviewed manifest inventory to this isolated stage.
+; This payload contains runtime binaries and notices, never downloaded models.
+Source: "{#AiRuntimeFiles}\*"; DestDir: "{app}\ai-runtime"; Flags: ignoreversion recursesubdirs createallsubdirs; BeforeInstall: VerifyApplicationTargetBeforeCopy
 #ifdef RuntimeFiles
 Source: "{#RuntimeFiles}\vcruntime140.dll"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#RuntimeFiles}\vcruntime140_1.dll"; DestDir: "{app}"; Flags: ignoreversion
@@ -88,11 +101,11 @@ Source: "{#RuntimeFiles}\README.txt"; DestDir: "{app}"; DestName: "MSVC-RUNTIME.
 #endif
 
 [Icons]
-Name: "{autoprograms}\Yas"; Filename: "{app}\Yas.exe"; WorkingDir: "{app}"; AppUserModelID: "Yas.Browser"
-Name: "{autodesktop}\Yas"; Filename: "{app}\Yas.exe"; WorkingDir: "{app}"; Tasks: desktopicon; AppUserModelID: "Yas.Browser"
+Name: "{autoprograms}\Yas Browser"; Filename: "{app}\Yas.exe"; WorkingDir: "{app}"; AppUserModelID: "Yas.Browser"
+Name: "{autodesktop}\Yas Browser"; Filename: "{app}\Yas.exe"; WorkingDir: "{app}"; Tasks: desktopicon; AppUserModelID: "Yas.Browser"
 
 [Run]
-Filename: "{app}\Yas.exe"; Description: "Open Yas"; WorkingDir: "{app}"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\Yas.exe"; Description: "Open Yas Browser"; WorkingDir: "{app}"; Flags: nowait postinstall skipifsilent
 
 ; Application files and shortcuts are removed by Inno Setup's uninstall log.
 ; Deliberately no UninstallDelete entries for user profile/history/vault paths.
@@ -255,12 +268,42 @@ begin
   end;
 end;
 
+function FolderImagesAvailable(const Directory: String): Boolean;
+var
+  FindRec: TFindRec;
+  Mask: String;
+  Kind: Integer;
+begin
+  Result := True;
+  for Kind := 0 to 1 do begin
+    if Kind = 0 then Mask := '*.exe' else Mask := '*.dll';
+    if FindFirst(AddBackslash(Directory) + Mask, FindRec) then begin
+      try
+        repeat
+          if not ApplicationImageAvailable(AddBackslash(Directory) + FindRec.Name) then begin
+            Result := False;
+            Exit;
+          end;
+        until not FindNext(FindRec);
+      finally
+        FindClose(FindRec);
+      end;
+    end;
+  end;
+end;
+
+function AiRuntimeTargetsAvailable: Boolean;
+begin
+  Result := FolderImagesAvailable(ExpandConstant('{app}\ai-runtime')) and
+    FolderImagesAvailable(ExpandConstant('{app}\ai-runtime\lib\ollama'));
+end;
+
 function InitializeUninstall: Boolean;
 begin
-  Result := ApplicationImageAvailable(ExpandConstant('{app}\Yas.exe'));
+  Result := ApplicationImageAvailable(ExpandConstant('{app}\Yas.exe')) and AiRuntimeTargetsAvailable;
   if not Result then begin
     Log('Uninstall deferred because the Yas application image is still in use or unwritable.');
-    SuppressibleMsgBox('Yas is still running, including in the background, or its application file is in use. Let downloads finish, then exit Yas explicitly before uninstalling. Uninstall has not stopped any transfers. If Yas is already closed, check the application folder permissions and retry.', mbError, MB_OK, IDOK);
+    SuppressibleMsgBox('Yas or its local AI runtime is still running, including in the background, or an application file is in use. Let downloads and AI tasks finish, then exit Yas explicitly before uninstalling. Uninstall has not stopped any transfers. If Yas is already closed, check the application folder permissions and retry.', mbError, MB_OK, IDOK);
   end;
 end;
 
@@ -295,6 +338,10 @@ begin
   if Result <> '' then Exit;
   if not ApplicationImageAvailable(ExpandConstant('{app}\Yas.exe')) then begin
     Result := 'Yas is still running, including in the background, or its application file is in use. Let downloads finish, then exit Yas explicitly (use tray Exit and stop downloads when available) before updating. Setup has not stopped any transfers. If Yas is already closed, check the application folder permissions and retry.';
+    Exit;
+  end;
+  if not AiRuntimeTargetsAvailable then begin
+    Result := 'A Yas local AI runtime file is still in use or unwritable. Let AI tasks finish, then exit Yas explicitly before updating. Setup has not stopped any transfers. If Yas is already closed, check the application folder permissions and retry.';
     Exit;
   end;
   if (LegacyUninstaller <> '') and not LegacyWasRemoved and

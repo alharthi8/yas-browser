@@ -3,7 +3,6 @@ use serde::{Deserialize, Serialize};
 use std::{
     cell::{Cell, RefCell},
     collections::{hash_map::DefaultHasher, HashMap, HashSet},
-    fs,
     hash::{Hash, Hasher},
     path::{Component, Path, PathBuf, Prefix},
     rc::Rc,
@@ -96,13 +95,22 @@ pub struct Manager {
 }
 pub type Shared = Rc<RefCell<Manager>>;
 
-const LEDGER_FILE: &str = "downloads.dpapi";
+// Profile identity only: fingerprints below cover the downloads record, never
+// this shared database file or unrelated settings/vault transactions.
+const LEDGER_FILE: &str = "yas.redb";
 const LEDGER_VERSION: u32 = 1;
 const HISTORY_LIMIT: usize = 500;
 const MAX_LEDGER_BYTES: usize = 64 * 1024 * 1024;
 const MAX_DISK_RECORDS: usize = 100_000;
 const MAX_SAFE_ID: usize = 9_007_199_254_740_990;
 const RESTORED_INTERRUPTED:&str="Yas stopped before this download finished. Start the download again; its previous transfer cannot be resumed after a full restart.";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PersistPreflight {
+    Unchanged,
+    Throttled,
+    FullWork,
+}
 
 // Disk records deliberately cannot restore native capabilities, ownership,
 // callbacks, private sessions or saved runtime flags.
@@ -242,9 +250,7 @@ fn validate_ledger(ledger: &Ledger) -> Result<(), String> {
     Ok(())
 }
 fn fingerprint(bytes: &[u8]) -> u64 {
-    let mut hash = DefaultHasher::new();
-    hash.write(bytes);
-    hash.finish()
+    storage::fingerprint(bytes)
 }
 fn structure(ledger: &Ledger) -> u64 {
     let mut hash = DefaultHasher::new();
@@ -260,7 +266,10 @@ fn structure(ledger: &Ledger) -> u64 {
     hash.finish()
 }
 fn encode_ledger(ledger: &Ledger, max_file_bytes: usize) -> Result<Vec<u8>, String> {
-    let mut plain = serde_json::to_vec(ledger).map_err(|e| e.to_string())?;
+    let plain = postcard::to_allocvec(ledger).map_err(|e| e.to_string())?;
+    protect_ledger(plain, max_file_bytes)
+}
+fn protect_ledger(mut plain: Vec<u8>, max_file_bytes: usize) -> Result<Vec<u8>, String> {
     if plain.len() > max_file_bytes {
         plain.fill(0);
         return Err("Download history is too large to save.".into());
@@ -268,12 +277,64 @@ fn encode_ledger(ledger: &Ledger, max_file_bytes: usize) -> Result<Vec<u8>, Stri
     let protected = storage::protect(&plain, false);
     plain.fill(0);
     let encrypted = protected?;
-    // The loader bounds the encrypted file. DPAPI adds an envelope, so a
-    // plaintext-only bound could write a file that Yas refuses to reopen.
+    // DPAPI adds an envelope, so a plaintext-only bound could save a record
+    // that Yas refuses to reopen.
     if encrypted.len() > max_file_bytes {
         return Err("Download history is too large to save.".into());
     }
     Ok(encrypted)
+}
+fn decode_ledger(ciphertext: &[u8], legacy_json: bool) -> Result<Ledger, String> {
+    if ciphertext.len() > MAX_LEDGER_BYTES {
+        return Err("Saved download history is too large. The original data was preserved.".into());
+    }
+    let mut plain = storage::protect(ciphertext, true).map_err(|_| {
+        "Could not decrypt download history. The original data was preserved.".to_string()
+    })?;
+    let parsed = if plain.len() > MAX_LEDGER_BYTES {
+        Err("Saved download history is too large. The original data was preserved.".to_string())
+    } else if legacy_json {
+        serde_json::from_slice::<Ledger>(&plain).map_err(|_| {
+            "Saved download history is invalid. The original data was preserved.".to_string()
+        })
+    } else {
+        // from_bytes accepts a trailing payload. Require the entire versioned
+        // record so extra/forged fields cannot be silently ignored.
+        postcard::take_from_bytes::<Ledger>(&plain)
+            .map_err(|_| {
+                "Saved download history is invalid. The original data was preserved.".to_string()
+            })
+            .and_then(|(ledger, rest)| {
+                if rest.is_empty() {
+                    Ok(ledger)
+                } else {
+                    Err("Saved download history has trailing data. The original data was preserved.".into())
+                }
+            })
+    };
+    plain.fill(0);
+    let ledger = parsed?;
+    validate_ledger(&ledger)?;
+    Ok(ledger)
+}
+
+/// Convert the complete legacy ledger without applying normal history pruning.
+pub fn migrate_legacy_ledger(ciphertext: &[u8]) -> Result<Vec<u8>, String> {
+    encode_ledger(&decode_ledger(ciphertext, true)?, MAX_LEDGER_BYTES)
+}
+
+/// Explicit compatibility export; the database remains the authoritative store.
+pub fn export_legacy_ledger(ciphertext: &[u8]) -> Result<Vec<u8>, String> {
+    let ledger = decode_ledger(ciphertext, false)?;
+    let plain = serde_json::to_vec(&ledger).map_err(|e| e.to_string())?;
+    protect_ledger(plain, MAX_LEDGER_BYTES)
+}
+
+pub(crate) fn ledgers_equal(
+    legacy_ciphertext: &[u8],
+    db_ciphertext: &[u8],
+) -> Result<bool, String> {
+    Ok(decode_ledger(legacy_ciphertext, true)? == decode_ledger(db_ciphertext, false)?)
 }
 fn prune_history(records: &mut Vec<Record>, live: &HashSet<usize>) {
     let mut finished: Vec<_> = records
@@ -285,38 +346,29 @@ fn prune_history(records: &mut Vec<Record>, live: &HashSet<usize>) {
     let keep: HashSet<_> = finished.into_iter().take(HISTORY_LIMIT).collect();
     records.retain(|r| r.owner_private || live.contains(&r.id) || keep.contains(&r.id));
 }
+fn history_needs_pruning(records: &[Record], mut is_live: impl FnMut(usize) -> bool) -> bool {
+    records
+        .iter()
+        .filter(|row| !row.owner_private && !is_live(row.id))
+        .take(HISTORY_LIMIT + 1)
+        .count()
+        > HISTORY_LIMIT
+}
 impl Manager {
     pub fn load(root: &Path) -> Result<Self, String> {
         let path = root.join(LEDGER_FILE);
-        let metadata = match fs::metadata(&path) {
-            Ok(value) => value,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+        let encrypted = match storage::read_downloads(root)? {
+            Some(value) => value,
+            None => {
                 return Ok(Self {
                     ledger_path: Some(path),
                     ledger_loaded: true,
                     ..Self::default()
                 })
             }
-            Err(error) => return Err(format!("Could not read download history: {error}")),
         };
-        if !metadata.is_file() || metadata.len() > MAX_LEDGER_BYTES as u64 {
-            return Err(
-                "Saved download history is too large or invalid. The original file was preserved."
-                    .into(),
-            );
-        }
-        let encrypted =
-            fs::read(&path).map_err(|e| format!("Could not read download history: {e}"))?;
         let file_fingerprint = fingerprint(&encrypted);
-        let mut plain = storage::protect(&encrypted, true).map_err(|_| {
-            "Could not decrypt download history. The original file was preserved.".to_string()
-        })?;
-        let parsed = serde_json::from_slice::<Ledger>(&plain);
-        plain.fill(0);
-        let mut ledger = parsed.map_err(|_| {
-            "Saved download history is invalid. The original file was preserved.".to_string()
-        })?;
-        validate_ledger(&ledger)?;
+        let mut ledger = decode_ledger(&encrypted, false)?;
         ledger.records.sort_by_key(|r| r.id);
         let trim = ledger.records.len() > HISTORY_LIMIT;
         if trim {
@@ -339,6 +391,59 @@ impl Manager {
             ledger_needs_trim: trim,
             ..Self::default()
         })
+    }
+    fn persist_preflight(&self, force: bool, now: Instant) -> PersistPreflight {
+        if force
+            || self.ledger_needs_trim
+            || history_needs_pruning(&self.records, |id| {
+                self.running.contains_key(&id) || self.pending.contains_key(&id)
+            })
+        {
+            return PersistPreflight::FullWork;
+        }
+        let Some(saved) = &self.last_saved else {
+            return PersistPreflight::FullWork;
+        };
+        let regular = || self.records.iter().filter(|row| !row.owner_private);
+        let high_water = self
+            .next_regular
+            .max(regular().map(|row| row.id).max().unwrap_or(0));
+        if saved.version != LEDGER_VERSION
+            || saved.next_id != high_water
+            || self.next_regular != high_water
+            || self.next < high_water
+            || saved.records.len() != regular().count()
+        {
+            return PersistPreflight::FullWork;
+        }
+        let mut progress_matches = true;
+        for (row, old) in regular().zip(&saved.records) {
+            // Exact borrowed equality inherits previous URL/path validation.
+            // Changed structure or invalid progress must use full validation.
+            if row.received < 0
+                || row.total < -1
+                || row.id != old.id
+                || row.url != old.url
+                || row.path != old.path
+                || row.status != old.status
+                || row.message != old.message
+            {
+                return PersistPreflight::FullWork;
+            }
+            progress_matches &= row.received == old.received && row.total == old.total;
+        }
+        if progress_matches {
+            return PersistPreflight::Unchanged;
+        }
+        if self.last_save_structure == Some(structure(saved))
+            && self
+                .last_save_attempt
+                .is_some_and(|at| now.saturating_duration_since(at) < Duration::from_secs(2))
+        {
+            PersistPreflight::Throttled
+        } else {
+            PersistPreflight::FullWork
+        }
     }
     fn snapshot(&mut self) -> Ledger {
         self.next_regular = self.next_regular.max(
@@ -382,16 +487,16 @@ pub fn persist(manager: &Shared, root: &Path, force: bool) -> Result<(), String>
         if m.ledger_path.as_ref().is_some_and(|saved| saved != &path) {
             return Err("Download history belongs to another browser profile.".into());
         }
+        match m.persist_preflight(force, Instant::now()) {
+            PersistPreflight::Unchanged => return Ok(()),
+            PersistPreflight::Throttled => {
+                return m.last_save_error.clone().map_or(Ok(()), Err);
+            }
+            PersistPreflight::FullWork => {}
+        }
         let snapshot = m.snapshot();
         validate_ledger(&snapshot)?;
         if !force && !m.ledger_needs_trim && m.last_saved.as_ref() == Some(&snapshot) {
-            return Ok(());
-        }
-        if snapshot.records.is_empty()
-            && snapshot.next_id == 0
-            && m.ledger_fingerprint.is_none()
-            && !path.exists()
-        {
             return Ok(());
         }
         let current_structure = structure(&snapshot);
@@ -408,32 +513,35 @@ pub fn persist(manager: &Shared, root: &Path, force: bool) -> Result<(), String>
         m.last_save_structure = Some(current_structure);
         (snapshot, m.ledger_fingerprint, m.ledger_loaded)
     };
-    let result = (|| {
-        match fs::read(&path) {
-            Ok(current) if !loaded || expected != Some(fingerprint(&current)) => {
-                return Err(
-                    "Download history changed or was not loaded. The original file was preserved."
+    let result: Result<Option<u64>, String> =
+        (|| {
+            match storage::read_downloads(root)? {
+                Some(current) if !loaded || expected != Some(fingerprint(&current)) => return Err(
+                    "Download history changed or was not loaded. The original data was preserved."
                         .into(),
-                )
+                ),
+                Some(_) => {}
+                None if expected.is_none() => {}
+                None => {
+                    return Err(
+                        "Download history was removed outside Yas. It was not recreated.".into(),
+                    )
+                }
             }
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound && expected.is_none() => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Err(
-                    "Download history was removed outside Yas. It was not recreated.".into(),
-                )
+            // The common database may exist for bookmarks/passwords even when a
+            // private-only session has never created a download ledger record.
+            if snapshot.records.is_empty() && snapshot.next_id == 0 && expected.is_none() {
+                return Ok(None);
             }
-            Err(error) => return Err(format!("Could not read download history: {error}")),
-        }
-        if manager.borrow().last_saved.as_ref() == Some(&snapshot)
-            && !manager.borrow().ledger_needs_trim
-        {
-            return Ok(expected);
-        }
-        let encrypted = encode_ledger(&snapshot, MAX_LEDGER_BYTES)?;
-        storage::atomic_write(&path, &encrypted)?;
-        Ok(Some(fingerprint(&encrypted)))
-    })();
+            if manager.borrow().last_saved.as_ref() == Some(&snapshot)
+                && !manager.borrow().ledger_needs_trim
+            {
+                return Ok(expected);
+            }
+            let encrypted = encode_ledger(&snapshot, MAX_LEDGER_BYTES)?;
+            storage::write_downloads_if_unchanged(root, expected, &encrypted)?;
+            Ok(Some(fingerprint(&encrypted)))
+        })();
     let mut m = manager.borrow_mut();
     m.persisting = false;
     match result {
@@ -1532,8 +1640,14 @@ pub fn cancel_tab(manager: &Shared, tab_id: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    struct TestDirectory(PathBuf);
+    use std::{
+        fs,
+        sync::atomic::{AtomicU64, Ordering},
+    };
+    struct TestDirectory {
+        path: PathBuf,
+        store: Option<storage::ProfileStore>,
+    }
     impl TestDirectory {
         fn new() -> Self {
             static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -1547,22 +1661,26 @@ mod tests {
                 NEXT.fetch_add(1, Ordering::Relaxed)
             ));
             fs::create_dir(&path).unwrap();
-            Self(path)
+            // Match Browser's profile lifetime, including rejection and
+            // preservation checks after an externally corrupted ledger row.
+            let store = Some(storage::open_profile(&path).unwrap());
+            Self { path, store }
         }
         fn path(&self) -> &Path {
-            &self.0
+            &self.path
         }
     }
     impl Drop for TestDirectory {
         fn drop(&mut self) {
+            self.store.take();
             // Only remove this test's explicit, uniquely generated temp child.
-            if self.0.parent() == Some(std::env::temp_dir().as_path())
+            if self.path.parent() == Some(std::env::temp_dir().as_path())
                 && self
-                    .0
+                    .path
                     .file_name()
                     .is_some_and(|n| n.to_string_lossy().starts_with("yas-download-ledger-test-"))
             {
-                let _ = fs::remove_dir_all(&self.0);
+                let _ = fs::remove_dir_all(&self.path);
             }
         }
     }
@@ -1588,11 +1706,18 @@ mod tests {
         Rc::new(RefCell::new(manager))
     }
     fn read_test_ledger(root: &Path) -> Ledger {
-        let bytes = fs::read(root.join(LEDGER_FILE)).unwrap();
-        let mut plain = storage::protect(&bytes, true).unwrap();
-        let result = serde_json::from_slice(&plain).unwrap();
-        plain.fill(0);
-        result
+        decode_ledger(&read_test_ciphertext(root), false).unwrap()
+    }
+    fn read_test_ciphertext(root: &Path) -> Vec<u8> {
+        storage::read_downloads(root).unwrap().unwrap()
+    }
+    fn write_test_ciphertext(root: &Path, ciphertext: &[u8]) {
+        let current = storage::read_downloads(root).unwrap();
+        let expected = current.as_deref().map(fingerprint);
+        storage::write_downloads_if_unchanged(root, expected, ciphertext).unwrap();
+    }
+    fn legacy_ciphertext(ledger: &Ledger) -> Vec<u8> {
+        protect_ledger(serde_json::to_vec(ledger).unwrap(), MAX_LEDGER_BYTES).unwrap()
     }
     fn record() -> Record {
         Record {
@@ -1895,7 +2020,7 @@ mod tests {
                 false,
             ))],
         };
-        let plain_size = serde_json::to_vec(&ledger).unwrap().len();
+        let plain_size = postcard::to_allocvec(&ledger).unwrap().len();
         let encrypted = encode_ledger(&ledger, MAX_LEDGER_BYTES).unwrap();
         assert!(encrypted.len() > plain_size);
         // A scaled boundary exercises real DPAPI without allocating a64MiB
@@ -1905,7 +2030,126 @@ mod tests {
             encode_ledger(&ledger, encrypted.len()).unwrap().len(),
             encrypted.len()
         );
-        assert!(!root.path().join(LEDGER_FILE).exists());
+        assert!(storage::read_downloads(root.path()).unwrap().is_none());
+    }
+    #[test]
+    fn legacy_migration_and_explicit_export_preserve_every_row_order_and_counter() {
+        let root = TestDirectory::new();
+        let mut rows: Vec<_> = (1..=HISTORY_LIMIT + 7)
+            .rev()
+            .map(|id| LedgerRecord::snapshot(&saved_record(root.path(), id, "completed", false)))
+            .collect();
+        // Duplicate URLs and non-ASCII metadata must not be deduplicated or
+        // normalized by migration. Retention limits belong to Manager::load.
+        rows[1].url = rows[0].url.clone();
+        rows[1].message = Some("  UAE دبي fixture  ".into());
+        rows[2].status = "paused".into();
+        rows[2].total = -1;
+        let ledger = Ledger {
+            version: LEDGER_VERSION,
+            next_id: 900,
+            records: rows,
+        };
+        let legacy = legacy_ciphertext(&ledger);
+        let original = legacy.clone();
+        let migrated = migrate_legacy_ledger(&legacy).unwrap();
+        assert!(decode_ledger(&migrated, false).unwrap() == ledger);
+        assert!(ledgers_equal(&legacy, &migrated).unwrap());
+        assert_eq!(legacy, original);
+        let exported = export_legacy_ledger(&migrated).unwrap();
+        assert!(decode_ledger(&exported, true).unwrap() == ledger);
+        assert!(ledgers_equal(&exported, &migrated).unwrap());
+        assert!(storage::read_downloads(root.path()).unwrap().is_none());
+
+        write_test_ciphertext(root.path(), &migrated);
+        let restored = Manager::load(root.path()).unwrap();
+        assert_eq!(restored.records.len(), HISTORY_LIMIT);
+        assert_eq!(restored.next_regular, 900);
+        assert!(restored.ledger_needs_trim);
+        // Loading applies the existing history policy only in memory.
+        assert!(decode_ledger(&read_test_ciphertext(root.path()), false).unwrap() == ledger);
+    }
+    #[test]
+    fn ledger_codecs_reject_trailing_bytes_invalid_versions_and_mixed_formats() {
+        let root = TestDirectory::new();
+        let ledger = Ledger {
+            version: LEDGER_VERSION,
+            next_id: 7,
+            records: vec![LedgerRecord::snapshot(&saved_record(
+                root.path(),
+                7,
+                "completed",
+                false,
+            ))],
+        };
+        let legacy = legacy_ciphertext(&ledger);
+        let migrated = migrate_legacy_ledger(&legacy).unwrap();
+        assert!(export_legacy_ledger(&legacy).is_err());
+        assert!(migrate_legacy_ledger(&migrated).is_err());
+        let mut trailing = postcard::to_allocvec(&ledger).unwrap();
+        trailing.push(1);
+        let trailing = protect_ledger(trailing, MAX_LEDGER_BYTES).unwrap();
+        assert!(decode_ledger(&trailing, false).is_err());
+        assert!(export_legacy_ledger(&trailing).is_err());
+        assert!(ledgers_equal(&legacy, &trailing).is_err());
+        let mut unsupported = ledger.clone();
+        unsupported.version += 1;
+        assert!(migrate_legacy_ledger(&legacy_ciphertext(&unsupported)).is_err());
+        assert!(decode_ledger(
+            &encode_ledger(&unsupported, MAX_LEDGER_BYTES).unwrap(),
+            false
+        )
+        .is_err());
+        let mut different = ledger;
+        different.records[0].received += 1;
+        assert!(!ledgers_equal(
+            &legacy,
+            &encode_ledger(&different, MAX_LEDGER_BYTES).unwrap()
+        )
+        .unwrap());
+    }
+    #[test]
+    fn ledger_record_cas_rejects_a_stale_writer_without_touching_the_newer_ciphertext() {
+        let root = TestDirectory::new();
+        let first = test_manager(
+            root.path(),
+            vec![saved_record(root.path(), 7, "active", false)],
+        );
+        persist(&first, root.path(), true).unwrap();
+        let stale = fingerprint(&read_test_ciphertext(root.path()));
+        let second = Rc::new(RefCell::new(Manager::load(root.path()).unwrap()));
+        first.borrow_mut().records[0].status = "paused".into();
+        persist(&first, root.path(), true).unwrap();
+        let newer = read_test_ciphertext(root.path());
+        assert!(
+            storage::write_downloads_if_unchanged(root.path(), Some(stale), b"stale fixture")
+                .is_err()
+        );
+        second.borrow_mut().records[0].received += 1;
+        assert!(persist(&second, root.path(), true).is_err());
+        assert_eq!(read_test_ciphertext(root.path()), newer);
+    }
+    #[test]
+    fn unrelated_database_settings_do_not_conflict_with_the_download_record() {
+        let root = TestDirectory::new();
+        let manager = test_manager(
+            root.path(),
+            vec![saved_record(root.path(), 7, "active", false)],
+        );
+        persist(&manager, root.path(), true).unwrap();
+        let original = read_test_ciphertext(root.path());
+        let mut settings = storage::read_settings(root.path()).unwrap();
+        settings.custom_filters = "! synthetic settings transaction".into();
+        storage::write_settings(root.path(), &settings).unwrap();
+        persist(&manager, root.path(), true).unwrap();
+        assert_eq!(read_test_ciphertext(root.path()), original);
+        manager.borrow_mut().records[0].status = "paused".into();
+        persist(&manager, root.path(), true).unwrap();
+        assert_eq!(read_test_ledger(root.path()).records[0].status, "paused");
+        assert_eq!(
+            storage::read_settings(root.path()).unwrap().custom_filters,
+            settings.custom_filters
+        );
     }
     #[test]
     fn monitor_registration_failure_stays_failed_after_late_native_completion_or_cancel() {
@@ -1947,7 +2191,7 @@ mod tests {
             ],
         );
         persist(&manager, root.path(), false).unwrap();
-        let encrypted = fs::read(root.path().join(LEDGER_FILE)).unwrap();
+        let encrypted = read_test_ciphertext(root.path());
         assert!(serde_json::from_slice::<serde_json::Value>(&encrypted).is_err());
         assert!(!encrypted
             .windows(b"fixture-token".len())
@@ -1966,14 +2210,14 @@ mod tests {
         assert_eq!(read_test_ledger(root.path()).records.len(), 1);
     }
     #[test]
-    fn a_private_only_session_creates_no_history_file_or_persisted_id_counter() {
+    fn a_private_only_session_creates_no_history_record_or_persisted_id_counter() {
         let root = TestDirectory::new();
         let manager = test_manager(
             root.path(),
             vec![saved_record(root.path(), 99, "failed", true)],
         );
         persist(&manager, root.path(), true).unwrap();
-        assert!(!root.path().join(LEDGER_FILE).exists());
+        assert!(storage::read_downloads(root.path()).unwrap().is_none());
         assert_eq!(Manager::load(root.path()).unwrap().next, 0);
         assert_eq!(forget_private_finished(&manager), 1);
         assert!(manager.borrow().records.is_empty());
@@ -2052,10 +2296,10 @@ mod tests {
             vec![saved_record(root.path(), 7, "active", false)],
         );
         persist(&manager, root.path(), false).unwrap();
-        let first = fs::read(root.path().join(LEDGER_FILE)).unwrap();
+        let first = read_test_ciphertext(root.path());
         manager.borrow_mut().records[0].received += 10;
         persist(&manager, root.path(), false).unwrap();
-        assert_eq!(first, fs::read(root.path().join(LEDGER_FILE)).unwrap());
+        assert_eq!(first, read_test_ciphertext(root.path()));
         manager.borrow_mut().records[0].status = "paused".into();
         persist(&manager, root.path(), false).unwrap();
         assert_eq!(read_test_ledger(root.path()).records[0].status, "paused");
@@ -2083,14 +2327,14 @@ mod tests {
     fn corrupt_history_and_an_unloaded_default_manager_cannot_overwrite_the_original() {
         let root = TestDirectory::new();
         let original = b"deliberately invalid encrypted fixture";
-        fs::write(root.path().join(LEDGER_FILE), original).unwrap();
+        write_test_ciphertext(root.path(), original);
         assert!(Manager::load(root.path()).is_err());
         let manager = Rc::new(RefCell::new(Manager {
             records: vec![saved_record(root.path(), 7, "completed", false)],
             ..Manager::default()
         }));
         assert!(persist(&manager, root.path(), true).is_err());
-        assert_eq!(fs::read(root.path().join(LEDGER_FILE)).unwrap(), original);
+        assert_eq!(read_test_ciphertext(root.path()), original);
     }
     #[test]
     fn forged_runtime_fields_and_external_changes_are_rejected_without_replacing_ciphertext() {
@@ -2104,10 +2348,13 @@ mod tests {
         let mut forged = serde_json::to_value(&ledger).unwrap();
         forged["records"][0]["can_resume"] = true.into();
         let encrypted = storage::protect(&serde_json::to_vec(&forged).unwrap(), false).unwrap();
-        fs::write(root.path().join(LEDGER_FILE), &encrypted).unwrap();
+        // Legacy JSON is not a valid database codec, and its forged runtime
+        // fields must also prevent legacy migration.
+        assert!(migrate_legacy_ledger(&encrypted).is_err());
+        write_test_ciphertext(root.path(), &encrypted);
         assert!(Manager::load(root.path()).is_err());
         assert!(persist(&manager, root.path(), true).is_err());
-        assert_eq!(fs::read(root.path().join(LEDGER_FILE)).unwrap(), encrypted);
+        assert_eq!(read_test_ciphertext(root.path()), encrypted);
     }
     #[test]
     fn ledger_validation_rejects_unsafe_paths_duplicate_ids_and_unknown_states() {
@@ -2170,5 +2417,186 @@ mod tests {
         assert_eq!(loaded.records.len(), HISTORY_LIMIT);
         assert_eq!(loaded.records[0].id, 11);
         assert_eq!(loaded.next, 510);
+    }
+
+    #[test]
+    fn persistence_preflight_prunes_after_an_owner_retires_without_row_changes() {
+        let root = TestDirectory::new();
+        let rows: Vec<_> = (1..=501)
+            .map(|id| saved_record(root.path(), id, "completed", false))
+            .collect();
+        assert!(!history_needs_pruning(&rows, |id| id == 1));
+        assert!(history_needs_pruning(&rows, |_| false));
+        assert!(!history_needs_pruning(&rows[..500], |_| false));
+        let mut with_private = rows.clone();
+        with_private[0].owner_private = true;
+        assert!(!history_needs_pruning(&with_private, |_| false));
+
+        // A validated snapshot could contain 500 finished rows plus a live
+        // owner. Reproduce its retirement without fabricating any COM owner.
+        let ledger = Ledger {
+            version: LEDGER_VERSION,
+            next_id: 501,
+            records: rows.iter().map(LedgerRecord::snapshot).collect(),
+        };
+        let encrypted = encode_ledger(&ledger, MAX_LEDGER_BYTES).unwrap();
+        let path = root.path().join(LEDGER_FILE);
+        write_test_ciphertext(root.path(), &encrypted);
+        let manager = Rc::new(RefCell::new(Manager {
+            records: rows,
+            next: 501,
+            next_regular: 501,
+            ledger_path: Some(path),
+            ledger_loaded: true,
+            ledger_fingerprint: Some(fingerprint(&encrypted)),
+            last_save_structure: Some(structure(&ledger)),
+            last_saved: Some(ledger),
+            last_save_attempt: Some(Instant::now()),
+            ..Manager::default()
+        }));
+        assert_eq!(
+            manager.borrow().persist_preflight(false, Instant::now()),
+            PersistPreflight::FullWork
+        );
+        persist(&manager, root.path(), false).unwrap();
+        let saved = read_test_ledger(root.path());
+        assert_eq!(saved.records.len(), HISTORY_LIMIT);
+        assert_eq!(saved.records[0].id, 2);
+        assert_eq!(saved.next_id, 501);
+    }
+
+    #[test]
+    fn persistence_preflight_preserves_boundaries_validation_and_id_bookkeeping() {
+        let root = TestDirectory::new();
+        let manager = test_manager(
+            root.path(),
+            vec![saved_record(root.path(), 7, "active", false)],
+        );
+        persist(&manager, root.path(), true).unwrap();
+        let now = Instant::now();
+        let mut m = manager.borrow_mut();
+        assert_eq!(m.persist_preflight(false, now), PersistPreflight::Unchanged);
+        assert_eq!(m.persist_preflight(true, now), PersistPreflight::FullWork);
+        m.records[0].received += 1;
+        m.last_save_attempt = Some(now - Duration::from_millis(1999));
+        assert_eq!(m.persist_preflight(false, now), PersistPreflight::Throttled);
+        m.last_save_attempt = Some(now - Duration::from_secs(2));
+        assert_eq!(m.persist_preflight(false, now), PersistPreflight::FullWork);
+        m.last_save_attempt = Some(now - Duration::from_millis(2001));
+        assert_eq!(m.persist_preflight(false, now), PersistPreflight::FullWork);
+        m.last_save_attempt = Some(now);
+        m.records[0].total = -1;
+        assert_eq!(m.persist_preflight(false, now), PersistPreflight::Throttled);
+        m.records[0].total = -2;
+        assert_eq!(m.persist_preflight(false, now), PersistPreflight::FullWork);
+        m.records[0].total = m.last_saved.as_ref().unwrap().records[0].total;
+        m.records[0].received = -1;
+        assert_eq!(m.persist_preflight(false, now), PersistPreflight::FullWork);
+        m.records[0].received = m.last_saved.as_ref().unwrap().records[0].received;
+        let original = m.records[0].clone();
+        for changed in ["url", "path", "status", "message", "id"] {
+            m.records[0] = original.clone();
+            match changed {
+                "url" => m.records[0].url = "not a valid URI".into(),
+                "path" => m.records[0].path = Some("relative.bin".into()),
+                "status" => m.records[0].status = "paused".into(),
+                "message" => m.records[0].message = Some("changed".into()),
+                "id" => m.records[0].id = 0,
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                m.persist_preflight(false, now),
+                PersistPreflight::FullWork,
+                "{changed} must receive full validation"
+            );
+        }
+        m.records[0] = original;
+        m.next_regular = 0;
+        m.next = 0;
+        assert_eq!(m.persist_preflight(false, now), PersistPreflight::FullWork);
+        drop(m);
+        persist(&manager, root.path(), false).unwrap();
+        assert_eq!(manager.borrow().next_regular, 7);
+        assert_eq!(manager.borrow().next, 7);
+    }
+
+    #[test]
+    fn persistence_preflight_replays_errors_and_keeps_forced_and_structural_saves() {
+        let root = TestDirectory::new();
+        let manager = test_manager(
+            root.path(),
+            vec![saved_record(root.path(), 7, "active", false)],
+        );
+        persist(&manager, root.path(), true).unwrap();
+        let initial = read_test_ciphertext(root.path());
+        {
+            let mut m = manager.borrow_mut();
+            m.records[0].received += 10;
+            m.last_save_attempt = Some(Instant::now());
+            m.last_save_error = Some("fixture write failure".into());
+        }
+        assert_eq!(
+            persist(&manager, root.path(), false),
+            Err("fixture write failure".into())
+        );
+        assert_eq!(read_test_ciphertext(root.path()), initial);
+        manager.borrow_mut().records[0].status = "paused".into();
+        persist(&manager, root.path(), false).unwrap();
+        assert_eq!(read_test_ledger(root.path()).records[0].status, "paused");
+        assert!(manager.borrow().last_save_error.is_none());
+        manager.borrow_mut().records[0].path = Some(
+            root.path()
+                .join("changed.bin")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        persist(&manager, root.path(), false).unwrap();
+        assert!(read_test_ledger(root.path()).records[0]
+            .path
+            .as_ref()
+            .unwrap()
+            .ends_with("changed.bin"));
+        manager.borrow_mut().records[0].received += 1;
+        persist(&manager, root.path(), true).unwrap();
+        assert_eq!(
+            read_test_ledger(root.path()).records[0].received,
+            manager.borrow().records[0].received
+        );
+        let foreign = TestDirectory::new();
+        assert!(persist(&manager, foreign.path(), false)
+            .unwrap_err()
+            .contains("another browser profile"));
+        assert!(storage::read_downloads(foreign.path()).unwrap().is_none());
+        let unchanged = read_test_ciphertext(root.path());
+        manager.borrow_mut().records[0].received = -1;
+        assert!(persist(&manager, root.path(), false).is_err());
+        assert_eq!(read_test_ciphertext(root.path()), unchanged);
+    }
+
+    #[test]
+    fn private_progress_stays_out_of_fast_saves_and_force_rechecks_ciphertext() {
+        let root = TestDirectory::new();
+        let manager = test_manager(
+            root.path(),
+            vec![saved_record(root.path(), 7, "completed", false)],
+        );
+        persist(&manager, root.path(), true).unwrap();
+        let initial = read_test_ciphertext(root.path());
+        let mut private = saved_record(root.path(), 999, "active", true);
+        private.received += 10;
+        manager.borrow_mut().records.push(private);
+        assert_eq!(
+            manager.borrow().persist_preflight(false, Instant::now()),
+            PersistPreflight::Unchanged
+        );
+        persist(&manager, root.path(), false).unwrap();
+        assert_eq!(read_test_ciphertext(root.path()), initial);
+        assert_eq!(manager.borrow().next_regular, 7);
+        assert_eq!(read_test_ledger(root.path()).records.len(), 1);
+        let mut externally_changed = initial;
+        externally_changed.push(1);
+        write_test_ciphertext(root.path(), &externally_changed);
+        assert!(persist(&manager, root.path(), true).is_err());
+        assert_eq!(read_test_ciphertext(root.path()), externally_changed);
     }
 }
