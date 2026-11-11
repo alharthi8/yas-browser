@@ -1,0 +1,465 @@
+{
+  "build": {
+    "compiler": "rustc 1.99.1 (58cf8f9c3 2026-10-13)\nbinary: rustc\ncommit-hash: 58cf8f9c35b355199727627d07ae34a4e2846d67\ncommit-date: 2026-10-13\nhost: x86_64-pc-windows-msvc\nrelease: 1.99.1\nLLVM version: 23.1.1",
+    "compiler_policy": "Cargo.toml profiles and default root features; resource link argument or example-only allocation instrumentation does not alter engine dependency compilation",
+    "dependency_features": [
+      {
+        "features": [
+          "addr",
+          "default",
+          "embedded-domain-resolver",
+          "full-regex-handling",
+          "single-thread"
+        ],
+        "id": "registry+https://github.com/rust-lang/crates.io-index#adblock@0.13.5"
+      },
+      {
+        "features": [
+          "psl"
+        ],
+        "id": "registry+https://github.com/rust-lang/crates.io-index#addr@0.15.6"
+      },
+      {
+        "features": [
+          "perf-literal",
+          "std"
+        ],
+        "id": "registry+https://github.com/rust-lang/crates.io-index#aho-corasick@1.1.5"
+      },
+      {
+        "features": [
+          "default",
+          "std"
+        ],
+        "id": "registry+https://github.com/rust-lang/crates.io-index#arrayvec@0.7.8"
+      },
+      {
+        "features": [
+          "alloc",
+          "default",
+          "std"
+        ],
+        "id": "registry+https://github.com/rust-lang/crates.io-index#base64@0.22.1"
+      },
+      {
+        "features": [
+          "serde",
+          "serde_core",
+          "std"
+        ],
+        "id": "registry+https://github.com/rust-lang/crates.io-index#bitflags@2.13.2"
+      },
+      {
+        "features": [],
+        "id": "registry+https://github.com/rust-lang/crates.io-index#displaydoc@0.2.7"
+      },
+      {
+        "features": [
+          "std",
+          "use_std"
+        ],
+        "id": "registry+https://github.com/rust-lang/crates.io-index#either@1.19.0"
+      },
+      {
+        "features": [
+          "default",
+          "std"
+        ],
+        "id": "registry+https://github.com/rust-lang/crates.io-index#flatbuffers@25.12.19"
+      },
+      {
+        "features": [],
+        "id": "registry+https://github.com/rust-lang/crates.io-index#icu_collections@2.4.0"
+      },
+      {
+        "features": [
+          "zerovec"
+        ],
+        "id": "registry+https://github.com/rust-lang/crates.io-index#icu_locale_core@2.4.0"
+      },
+      {
+        "features": [
+          "compiled_data"
+        ],
+        "id": "registry+https://github.com/rust-lang/crates.io-index#icu_normalizer@2.4.0"
+      },
+      {
+        "features": [],
+        "id": "registry+https://github.com/rust-lang/crates.io-index#icu_normalizer_data@2.4.0"
+      },
+      {
+        "features": [
+          "compiled_data"
+        ],
+        "id": "registry+https://github.com/rust-lang/crates.io-index#icu_properties@2.4.0"
+      },
+      {
+        "features": [],
+        "id": "registry+https://github.com/rust-lang/crates.io-index#icu_properties_data@2.4.0"
+      },
+      {
+        "features": [
+          "baked"
+        ],
+        "id": "registry+https://github.com/rust-lang/crates.io-index#icu_provider@2.4.0"
+      },
+      {
+        "features": [
+          "alloc",
+          "compiled_data",
+          "default",
+          "std"
+        ],
+        "id": "registry+https://github.com/rust-lang/crates.io-index#idna@1.1.0"
+      },
+      {
+        "features": [
+          "compiled_data"
+        ],
+        "id": "registry+https://github.com/rust-lang/crates.io-index#idna_adapter@1.2.2"
+      },
+      {
+        "features": [
+          "default",
+          "use_alloc",
+          "use_std"
+        ],
+        "id": "registry+https://github.com/rust-lang/crates.io-index#itertools@0.14.0"
+      },
+      {
+        "features": [],
+        "id": "registry+https://github.com/rust-lang/crates.io-index#itoa@1.0.18"
+      },
+      {
+        "features": [],
+        "id": "registry+https://github.com/rust-lang/crates.io-index#litemap@0.8.3"
+      },
+      {
+        "features": [
+          "alloc",
+          "default",
+          "std"
+        ],
+        "id": "registry+https://github.com/rust-lang/crates.io-index#memchr@2.8.3"
+      },
+      {
+        "features": [
+          "alloc",
+          "default",
+          "std"
+        ],
+        "id": "registry+https://github.com/rust-lang/crates.io-index#percent-encoding@2.3.2"
+      },
+      {
+        "features": [
+          "zerovec"
+        ],
+        "id": "registry+https://github.com/rust-lang/crates.io-index#potential_utf@0.1.6"
+      },
+      {
+        "features": [
+          "default",
+          "proc-macro"
+        ],
+        "id": "registry+https://github.com/rust-lang/crates.io-index#proc-macro2@1.0.107"
+      },
+      {
+        "features": [],
+        "id": "registry+https://github.com/rust-lang/crates.io-index#psl-types@2.0.11"
+      },
+      {
+        "features": [
+          "default",
+          "helpers"
+        ],
+        "id": "registry+https://github.com/rust-lang/crates.io-index#psl@2.1.248"
+      },
+      {
+        "features": [
+          "default",
+          "proc-macro"
+        ],
+        "id": "registry+https://github.com/rust-lang/crates.io-index#quote@1.0.47"
+      },
+      {
+        "features": [
+          "alloc",
+          "dfa-onepass",
+          "hybrid",
+          "meta",
+          "nfa-backtrack",
+          "nfa-pikevm",
+          "nfa-thompson",
+          "perf-inline",
+          "perf-literal",
+          "perf-literal-multisubstring",
+          "perf-literal-substring",
+          "std",
+          "syntax",
+          "unicode",
+          "unicode-age",
+          "unicode-bool",
+          "unicode-case",
+          "unicode-gencat",
+          "unicode-perl",
+          "unicode-script",
+          "unicode-segment",
+          "unicode-word-boundary"
+        ],
+        "id": "registry+https://github.com/rust-lang/crates.io-index#regex-automata@0.4.18"
+      },
+      {
+        "features": [
+          "default",
+          "std",
+          "unicode",
+          "unicode-age",
+          "unicode-bool",
+          "unicode-case",
+          "unicode-gencat",
+          "unicode-perl",
+          "unicode-script",
+          "unicode-segment"
+        ],
+        "id": "registry+https://github.com/rust-lang/crates.io-index#regex-syntax@0.8.11"
+      },
+      {
+        "features": [
+          "default",
+          "perf",
+          "perf-backtrack",
+          "perf-cache",
+          "perf-dfa",
+          "perf-inline",
+          "perf-literal",
+          "perf-onepass",
+          "std",
+          "unicode",
+          "unicode-age",
+          "unicode-bool",
+          "unicode-case",
+          "unicode-gencat",
+          "unicode-perl",
+          "unicode-script",
+          "unicode-segment"
+        ],
+        "id": "registry+https://github.com/rust-lang/crates.io-index#regex@1.13.1"
+      },
+      {
+        "features": [
+          "default",
+          "std"
+        ],
+        "id": "registry+https://github.com/rust-lang/crates.io-index#rustc-hash@2.1.3"
+      },
+      {
+        "features": [],
+        "id": "registry+https://github.com/rust-lang/crates.io-index#rustc_version@0.4.1"
+      },
+      {
+        "features": [
+          "default"
+        ],
+        "id": "registry+https://github.com/rust-lang/crates.io-index#seahash@4.1.0"
+      },
+      {
+        "features": [
+          "default",
+          "std"
+        ],
+        "id": "registry+https://github.com/rust-lang/crates.io-index#semver@1.0.28"
+      },
+      {
+        "features": [
+          "alloc",
+          "default",
+          "derive",
+          "serde_derive",
+          "std"
+        ],
+        "id": "registry+https://github.com/rust-lang/crates.io-index#serde@1.0.229"
+      },
+      {
+        "features": [
+          "alloc",
+          "default",
+          "result",
+          "std"
+        ],
+        "id": "registry+https://github.com/rust-lang/crates.io-index#serde_core@1.0.229"
+      },
+      {
+        "features": [
+          "default"
+        ],
+        "id": "registry+https://github.com/rust-lang/crates.io-index#serde_derive@1.0.229"
+      },
+      {
+        "features": [
+          "default",
+          "std"
+        ],
+        "id": "registry+https://github.com/rust-lang/crates.io-index#serde_json@1.0.154"
+      },
+      {
+        "features": [
+          "const_generics",
+          "const_new",
+          "union"
+        ],
+        "id": "registry+https://github.com/rust-lang/crates.io-index#smallvec@1.16.5"
+      },
+      {
+        "features": [
+          "alloc",
+          "default",
+          "std"
+        ],
+        "id": "registry+https://github.com/rust-lang/crates.io-index#stable_deref_trait@1.2.1"
+      },
+      {
+        "features": [
+          "clone-impls",
+          "default",
+          "derive",
+          "extra-traits",
+          "full",
+          "parsing",
+          "printing",
+          "proc-macro",
+          "visit",
+          "visit-mut"
+        ],
+        "id": "registry+https://github.com/rust-lang/crates.io-index#syn@2.0.119"
+      },
+      {
+        "features": [
+          "clone-impls",
+          "default",
+          "derive",
+          "extra-traits",
+          "fold",
+          "full",
+          "parsing",
+          "printing",
+          "proc-macro",
+          "visit",
+          "visit-mut"
+        ],
+        "id": "registry+https://github.com/rust-lang/crates.io-index#syn@3.0.9"
+      },
+      {
+        "features": [
+          "default",
+          "proc-macro"
+        ],
+        "id": "registry+https://github.com/rust-lang/crates.io-index#synstructure@0.14.0"
+      },
+      {
+        "features": [],
+        "id": "registry+https://github.com/rust-lang/crates.io-index#thiserror-impl@1.0.69"
+      },
+      {
+        "features": [],
+        "id": "registry+https://github.com/rust-lang/crates.io-index#thiserror@1.0.69"
+      },
+      {
+        "features": [
+          "zerovec"
+        ],
+        "id": "registry+https://github.com/rust-lang/crates.io-index#tinystr@0.8.5"
+      },
+      {
+        "features": [],
+        "id": "registry+https://github.com/rust-lang/crates.io-index#unicode-ident@1.0.27"
+      },
+      {
+        "features": [],
+        "id": "registry+https://github.com/rust-lang/crates.io-index#utf8_iter@1.1.0"
+      },
+      {
+        "features": [],
+        "id": "registry+https://github.com/rust-lang/crates.io-index#utf_types@1.0.0"
+      },
+      {
+        "features": [],
+        "id": "registry+https://github.com/rust-lang/crates.io-index#writeable@0.6.4"
+      },
+      {
+        "features": [],
+        "id": "registry+https://github.com/rust-lang/crates.io-index#yoke-derive@0.8.4"
+      },
+      {
+        "features": [
+          "derive",
+          "zerofrom"
+        ],
+        "id": "registry+https://github.com/rust-lang/crates.io-index#yoke@0.8.4"
+      },
+      {
+        "features": [],
+        "id": "registry+https://github.com/rust-lang/crates.io-index#zerofrom-derive@0.1.8"
+      },
+      {
+        "features": [
+          "derive"
+        ],
+        "id": "registry+https://github.com/rust-lang/crates.io-index#zerofrom@0.1.8"
+      },
+      {
+        "features": [
+          "yoke",
+          "zerofrom"
+        ],
+        "id": "registry+https://github.com/rust-lang/crates.io-index#zerotrie@0.2.5"
+      },
+      {
+        "features": [],
+        "id": "registry+https://github.com/rust-lang/crates.io-index#zerovec-derive@0.11.7"
+      },
+      {
+        "features": [
+          "derive",
+          "yoke"
+        ],
+        "id": "registry+https://github.com/rust-lang/crates.io-index#zerovec@0.11.9"
+      },
+      {
+        "features": [],
+        "id": "registry+https://github.com/rust-lang/crates.io-index#zmij@1.0.23"
+      }
+    ],
+    "encoded_rustflags": "",
+    "engine_features": [
+      "addr",
+      "default",
+      "embedded-domain-resolver",
+      "full-regex-handling",
+      "single-thread"
+    ],
+    "engine_version": "0.13.5",
+    "profile": "release",
+    "rustflags": "",
+    "schema": 1,
+    "target": "x86_64-pc-windows-msvc"
+  },
+  "constructor_policy": "Yas-bundled-filter-cache-v1;Engine::new_with_list_text;FilterSet::new(false);ParseOptions::default;unchanged-effective-input-only;no-added-resources-or-tags",
+  "input": {
+    "bytes": 3596970,
+    "sha256": "0F75C42B9F8E9F1C3324094063B33525E2876C7A083CD927A7F1218591BC4B8F"
+  },
+  "payload": {
+    "bytes": 6062685,
+    "sha256": "A80F9A2A695D79F8FD3A15D76B4611E9E55E5DA3B6205FE325FF3929B42124FA"
+  },
+  "schema": 1,
+  "sources": {
+    "Cargo.lock": "E62E9FDBE20FDF3F98799DDE97553A958E8522B0EDF0A835BDF91E99AF46B058",
+    "Cargo.toml": "533EC14EE800F6E1B8B37D090F95D411B56E2BA4B37484B140757C5E023AE085",
+    "build.ps1": "3B353E88EC65AA54EAD8E825CEFB65928010C89985129324F94EEA1258E6D744",
+    "filters/cache_sha256.rs": "8CB05B9B0AE781295C6C804A376C8CDEE5CB2579B3E6225B4B0FCD9C5F59BB0D",
+    "filters/generate_bundled_cache.rs": "AB75979E535959684470972DD9DE0B8669F038FBEC340180D5B83234967FB60B",
+    "src/blocker.rs": "7C3E4026B04D1BA2BC3FBF14086A945EE85C8697AF3C18A1BAD90345B01F2547",
+    "src/filter_cache.rs": "C1CBEC24CEFCE35DCA9B747DAEFC043E9262B76F99FFC466AB8096F5638FE23A"
+  }
+}

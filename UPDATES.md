@@ -1,17 +1,57 @@
-# Signed GitHub updates
+# Yas Browser updates
 
-Windows previews check GitHub on startup and from Settings > Check for app updates. Startup checks fail quietly offline; manual checks report failures. Users approve an update. Its signed ZIP is checked against the public key in release.pub, then the running executable is replaced using self_update/self-replace. Restart when convenient; the app does not kill active sends, downloads, or sessions. Fully quit Yas Browser through its tray when downloads keep it running.
+The installed Windows browser checks once daily while regular browsing is active.
+Turn this off under Settings → Yas Browser updates, or check manually there.
+Checks request one fixed public GitHub release file; they do not send browsing
+history, passwords, page content, or account identities. GitHub receives the
+ordinary network request, including its source IP address.
 
-Install the 0.4.6 bootstrap installer once. Older previews do not contain the updater. User data is outside the executable and retained. This channel updates the executable; changes requiring new runtimes or installation layout need a new full installer. The updater applies per-user writable installations and portable copies; it does not request administrator rights.
+An available update is downloaded only after the user chooses Download update.
+Yas verifies the signed release metadata with the existing `release.pub` key,
+then checks the complete installer's exact size and SHA-256 digest. Redirects
+are limited to this repository's GitHub release paths and GitHub's release asset
+host. Invalid, expired, altered, oversized, or downgraded releases fail closed.
 
-Maintainers: update Cargo version and branding/yas.rc, commit, then push a matching vVERSION tag. The Windows workflow builds/tests, creates a version-bound signed ZIP, verifies it using the built app, rejects a corrupted package, creates a draft with the bootstrap installer, then publishes. GitHub signing secret: YAS_UPDATE_SIGNING_KEY. Private keys never belong in source or release assets. Back up and retain the existing private key; replacing the key breaks existing clients unless key rotation support ships first.
+Restart to update requires all browser transfers, paused transfers, and AI tasks
+to finish or be canceled first. It saves regular tabs, ends Stealth, and waits for
+the exact browser process to exit. A private, byte-verified backup of application
+storage files is made while holding the profile lock. The full per-user installer
+updates the browser and its bundled runtime; it never forcibly closes another
+browser process. The updated executable version and profile are checked before
+Yas reopens. If installation or verification fails, the private backup remains.
 
-The artifact signature is separate from Windows Authenticode publisher signing.
+Backups live in `update-backups` under the browser's profile directory. They can
+contain encrypted passwords and browsing records; do not publish them. Website
+engine profiles, model weights, and downloaded user files remain outside the
+application installation and are not overwritten by Setup.
 
-## macOS Apple Silicon previews
+Portable copies require a manual full-installer update. Earlier previews without
+this full-installer updater need the new bootstrap installer once. Windows may
+still apply its normal policy to unsigned executables: release signatures are
+separate from Windows Authenticode publisher signing.
 
-The macos/ subproject uses the same pinned per-app public key and a separate macos-vVERSION tag channel. An exact architecture/version asset name selects a signed ZIP containing the complete Yas Browser.app. ZIP signature verification and macOS bundle-signature verification happen before replacement. The complete app bundle is replaced; user data stays outside it. Users approve updates and fully quit/reopen afterwards. Install into a writable Applications folder. Intel is not supported by this channel.
+## Maintainer release process
 
-For a Mac release, bump the version in macos/Cargo.toml, update macos/RELEASE-NOTES.md, commit, and push a matching macos-vVERSION tag. The separate macos-release workflow builds/tests on Apple Silicon, checks the packaged native/frontend launch, verifies a signed full-bundle replacement and damaged-package rejection, and publishes a prerelease with --latest=false. Windows users keep the Windows latest release.
+Reuse the existing `alharthi8/yas-browser` repository and its protected
+`YAS_UPDATE_SIGNING_KEY` secret. Never replace the pinned key or commit a private
+key. Existing public-key identity is retained; private signing material is used
+only in memory in the reviewed release job. No paid updater service is required.
 
-Current Mac previews have ad-hoc development signatures, not Apple Developer ID signatures or notarization. Those Apple distribution steps require separate publisher setup. Private update keys remain only in the existing GitHub secret and protected offline backup. Do not rotate them without a compatible migration.
+1. Bump the Cargo, Windows resource, installer, and interface versions together.
+2. Build and run the release quality, native browser, migration, update, and
+   package tests. Keep exact executable and installer hashes in their reports.
+3. Run `node tools/prepare-update-release.mjs --output FRESH_DIRECTORY` after
+   finalization. Upload only its full installer and public `prevalidated.json`
+   to a draft `vVERSION` release, with the reviewed source on `main`.
+4. Run the manual Reviewed Windows update release workflow on `main`. It repeats
+   source and installer verification, signs metadata in a separate job, and
+   checks that the installed browser accepts the signature and rejects tampering.
+   Its default keeps the release as a draft. Set `publish` only when ready to
+   release the reviewed files to everyone. Keep macOS prereleases separate.
+5. Check the public signed feed and download again after publication. The signed
+   feed expires after 90 days; refresh its signature before expiration if no new
+   version is released. Expired feeds cannot authorize an installation.
+
+Signing and uploading a draft are not publication. Publishing a release makes it
+available to all clients. The browser never silently installs it or interrupts
+the user's active work.

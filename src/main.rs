@@ -1,20 +1,30 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
-mod ota;
 mod background;
 mod blocker;
 mod capture;
+mod database;
 mod downloads;
 mod identity;
+mod local_ai;
 mod migration;
+mod notifications;
+mod security;
 mod shortcuts;
 mod storage;
 mod suggestions;
+mod tab_memory;
+mod update_protocol;
+mod updater;
 use serde_json::{json, Value};
 use std::{
     cell::{Cell, RefCell},
     fs,
     path::PathBuf,
     rc::Rc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 use storage::*;
@@ -40,6 +50,19 @@ const TOP: f64 = 108.0;
 const VISIBLE_FIELD_JS: &str = r#"e=>{if(!e||e.hidden||e.closest('[hidden],[inert]')||!e.getClientRects().length||e.disabled||e.readOnly)return false;const s=getComputedStyle(e);return s.display!=='none'&&s.visibility!=='hidden'&&s.visibility!=='collapse'}"#;
 #[derive(Debug)]
 enum Msg {
+    UpdateChecked {
+        request: u64,
+        result: Result<Option<updater::CheckedRelease>, String>,
+    },
+    UpdateDownloaded {
+        request: u64,
+        result: Result<PathBuf, String>,
+    },
+    UpdateProgress {
+        request: u64,
+        completed: u64,
+        total: u64,
+    },
     CloseWindow,
     Reopen,
     ShowDownloads,
@@ -47,16 +70,44 @@ enum Msg {
     RestoreTray,
     Ui(Value),
     Navigate(usize, String),
-    Title(usize, String),
+    Title(usize),
     Loaded(usize, String),
     Popup(String, bool),
     RefreshUrl(usize),
     DownloadPrompt(usize),
     DownloadChanged,
+    NotificationsChanged,
+    NotificationCommit(usize),
     Toast(String),
     Filters(Result<String, String>),
     Tick,
     Extensions(Vec<Value>),
+    AiModels {
+        request: u64,
+        models: Result<Vec<local_ai::Model>, String>,
+    },
+    AiSetupProgress {
+        request: u64,
+        progress: local_ai::SetupProgress,
+    },
+    AiSetupDone {
+        request: u64,
+        result: Result<(), String>,
+    },
+    AiContext {
+        request: u64,
+        context: Result<(String, String), String>,
+        question: String,
+    },
+    AiAnswer {
+        request: u64,
+        answer: Result<String, String>,
+    },
+    Suspension {
+        tab: usize,
+        tag: tab_memory::SuspensionTag,
+        outcome: tab_memory::SuspensionOutcome,
+    },
 }
 struct Tab {
     id: usize,
@@ -68,7 +119,8 @@ struct Tab {
     downloading: Rc<Cell<usize>>,
     used: Instant,
     private: bool,
-    suspend_requested: Cell<bool>,
+    suspension: RefCell<tab_memory::Suspension>,
+    playing_audio: Cell<bool>,
 }
 struct Browser {
     window: Window,
@@ -80,14 +132,26 @@ struct Browser {
     active: usize,
     next: usize,
     panel: bool,
+    ai_side: bool,
     suggestions_open: bool,
     suggestions_height: f64,
     login_sites: RefCell<Option<Vec<String>>>,
+    update_request: u64,
+    update_cancel: Option<Arc<AtomicBool>>,
+    update_release: Option<updater::CheckedRelease>,
+    update_installer: Option<PathBuf>,
+    update_state: Value,
+    next_update_check: Instant,
     root: PathBuf,
+    store: Option<ProfileStore>,
     settings: Settings,
     shield: Rc<RefCell<blocker::Shield>>,
     proxy: EventLoopProxy<Msg>,
     downloads: downloads::Shared,
+    notifications: notifications::Shared,
+    notification_prompt_visible: bool,
+    reputation_warning: Option<String>,
+    notification_prompt_id: Option<usize>,
     updating: bool,
     settings_dirty: bool,
     settings_writable: bool,
@@ -99,8 +163,275 @@ struct Browser {
     pending_download_prompts: Vec<usize>,
     download_error: Option<String>,
     exiting: bool,
+    memory_policy: tab_memory::MemoryPolicy,
+    ai_request: u64,
+    ai_cancel: Option<Arc<AtomicBool>>,
+    ai_source: Option<(usize, String, Option<usize>)>,
+    ai_inflight: Option<u64>,
+    ai_models_request: u64,
+    ai_setup_request: u64,
+    ai_setup_cancel: Option<Arc<AtomicBool>>,
 }
 impl Browser {
+    fn ai_render(&self, value: Value) {
+        let _ = self
+            .shell
+            .evaluate_script(&format!("renderLocalAi({value})"));
+    }
+    fn ai_models(&mut self) {
+        if self.ai_setup_cancel.is_some() {
+            return;
+        }
+        self.ai_models_request = self.ai_models_request.wrapping_add(1);
+        let request = self.ai_models_request;
+        let proxy = self.proxy.clone();
+        std::thread::spawn(move || {
+            let _ = proxy.send_event(Msg::AiModels {
+                request,
+                models: local_ai::models(),
+            });
+        });
+    }
+    fn setup_ai(&mut self) {
+        if self.ai_inflight.is_some() {
+            self.ai_render(json!({"busy":true,"error":"Wait for the current local AI request to stop before setting up a model."}));
+            return;
+        }
+        if self.ai_cancel.is_some() || self.ai_setup_cancel.is_some() {
+            return;
+        }
+        // Ignore a discovery result queued before the explicit setup action.
+        self.ai_models_request = self.ai_models_request.wrapping_add(1);
+        self.ai_setup_request = self.ai_setup_request.wrapping_add(1);
+        let request = self.ai_setup_request;
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.ai_setup_cancel = Some(cancel.clone());
+        self.ai_render(json!({"setupBusy":true,"setupStatus":"Preparing local AI setup","setupCompleted":0,"error":""}));
+        let proxy = self.proxy.clone();
+        std::thread::spawn(move || {
+            // A blocked pull read needs its owned server closed to stop promptly.
+            // Join the watcher before publishing completion, so another setup
+            // cannot start while a delayed cancellation is still shutting down.
+            let finished = Arc::new(AtomicBool::new(false));
+            let watcher_finished = finished.clone();
+            let watcher_cancel = cancel.clone();
+            let watcher = std::thread::spawn(move || {
+                while !watcher_finished.load(Ordering::Acquire) {
+                    if watcher_cancel.load(Ordering::Acquire) {
+                        local_ai::shutdown();
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            });
+            let progress_proxy = proxy.clone();
+            let mut result = local_ai::setup(&cancel, move |progress| {
+                let _ = progress_proxy.send_event(Msg::AiSetupProgress { request, progress });
+            });
+            finished.store(true, Ordering::Release);
+            let _ = watcher.join();
+            if cancel.load(Ordering::Acquire) {
+                local_ai::shutdown();
+                result = Err("Local AI setup cancelled. Choose setup again to resume.".into());
+            }
+            let _ = proxy.send_event(Msg::AiSetupDone { request, result });
+        });
+    }
+    fn cancel_ai_setup(&mut self) {
+        if let Some(cancel) = &self.ai_setup_cancel {
+            cancel.store(true, Ordering::Release);
+            self.ai_render(json!({"setupBusy":true,"setupStatus":"Stopping the model download…"}));
+        }
+    }
+    fn cancel_ai(&mut self) {
+        self.ai_request = self.ai_request.wrapping_add(1);
+        if let Some(cancel) = self.ai_cancel.take() {
+            cancel.store(true, Ordering::Release);
+        }
+        self.ai_source = None;
+        let _ = self.shell.evaluate_script("clearLocalAi(false)");
+        if self.ai_inflight.is_some() {
+            self.ai_render(json!({"busy":true,"error":"Stopping the previous local AI request…"}));
+        }
+    }
+    fn ai_request_matches(&self, request: u64) -> bool {
+        request == self.ai_request
+            && self.ai_source.as_ref().is_some_and(|(id, url, epoch)| {
+                self.active_tab().is_some_and(|tab| {
+                    tab.id == *id
+                        && tab.url == *url
+                        && epoch.map_or(!tab.private, |epoch| {
+                            tab.private && epoch == self.stealth_session
+                        })
+                })
+            })
+    }
+    fn ask_ai(&mut self, question: String) {
+        if self.ai_inflight.is_some() {
+            self.ai_render(json!({"busy":true,"error":"Wait for the current local AI request to finish stopping."}));
+            return;
+        }
+        if self.ai_cancel.is_some() || self.ai_setup_cancel.is_some() {
+            return;
+        }
+        if question.trim().is_empty() || question.chars().count() > 2000 {
+            self.ai_render(
+                json!({"busy":false,"error":"Enter a question of up to 2,000 characters."}),
+            );
+            return;
+        }
+        let Some(tab) = self
+            .active_tab()
+            .filter(|tab| tab.view.is_some() && tab.url.starts_with("http"))
+        else {
+            self.ai_render(json!({"busy":false,"error":"Open a website to ask about its page or selected text."}));
+            return;
+        };
+        let source = (
+            tab.id,
+            tab.url.clone(),
+            tab.private.then_some(self.stealth_session),
+        );
+        self.ai_request = self.ai_request.wrapping_add(1);
+        let request = self.ai_request;
+        self.ai_source = Some(source);
+        self.ai_cancel = Some(Arc::new(AtomicBool::new(false)));
+        self.ai_render(json!({"busy":true,"answer":"","error":""}));
+        let proxy = self.proxy.clone();
+        let script = r#"(()=>{const selection=String(window.getSelection()||'').trim();let text='',count=0;for(const ch of(selection||document.body?.innerText||'')){if(count++===12000)break;text+=ch}return {url:location.href,text:text.toWellFormed()}})()"#;
+        let result = self
+            .active_tab()
+            .and_then(|tab| tab.view.as_ref())
+            .unwrap()
+            .evaluate_script_with_callback(script, move |result| {
+                let context = serde_json::from_str::<Value>(&result)
+                    .ok()
+                    .and_then(|data| {
+                        Some((
+                            data["url"].as_str()?.to_owned(),
+                            data["text"].as_str()?.to_owned(),
+                        ))
+                    })
+                    .filter(|(_, text)| !text.trim().is_empty())
+                    .ok_or_else(|| "This page has no readable text for local AI.".into());
+                let _ = proxy.send_event(Msg::AiContext {
+                    request,
+                    context,
+                    question: question.clone(),
+                });
+            });
+        if result.is_err() {
+            self.cancel_ai();
+            self.ai_render(json!({"busy":false,"error":"Could not read text from this page."}));
+        }
+    }
+    fn notification_ui(&mut self) {
+        notifications::pump(&self.notifications, &self.proxy);
+        for (tab, nonce) in notifications::take_ready_views(&self.notifications) {
+            if notifications::view_matches(&self.notifications, tab, nonce) {
+                if let Some(tab) = self.tabs.iter().find(|current| current.id == tab) {
+                    if let Some(view) = &tab.view {
+                        if tab.url != "yas://newtab" {
+                            if let Err(error) = view.load_url(&tab.url) {
+                                self.toast(&format!("Could not open page: {error}"));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let epoch = self
+            .active_tab()
+            .filter(|tab| tab.private)
+            .map(|_| self.stealth_session);
+        let state =
+            notifications::ui_state(&self.notifications, self.active, epoch, !self.background);
+        let previous = self.notification_prompt_id;
+        self.notification_prompt_id = state.prompt.as_ref().map(|prompt| prompt.id);
+        self.notification_prompt_visible = self.notification_prompt_id.is_some();
+        self.layout();
+        if self.notification_prompt_id.is_some()
+            && self.notification_prompt_id != previous
+            && !self.background
+        {
+            let _ = self.shell.focus();
+        }
+        let _ = self
+            .shell
+            .evaluate_script(&format!("notificationData({})", json!(state)));
+    }
+    fn notification_profile(&mut self) -> Result<(), String> {
+        if self.regular_keeper.is_none() {
+            self.regular_keeper = Some(
+                WebViewBuilder::new()
+                    .with_environment(self.shell.environment())
+                    .with_profile_name(identity::regular_profile(&self.root))
+                    .with_incognito(false)
+                    .with_visible(false)
+                    .with_focused(false)
+                    .with_bounds(Rect {
+                        position: LogicalPosition::new(0., 0.).into(),
+                        size: LogicalSize::new(1., 1.).into(),
+                    })
+                    .with_url("about:blank")
+                    .with_navigation_handler(|url| url == "about:blank")
+                    .build_as_child(&self.window)
+                    .map_err(|error| error.to_string())?,
+            );
+        }
+        notifications::initialize_profile(
+            self.regular_keeper.as_ref().unwrap(),
+            &self.notifications,
+            None,
+            &self.proxy,
+        )
+    }
+    fn notification_commit(&mut self, id: usize) {
+        let Some(intent) = notifications::commit_intent(&self.notifications, id) else {
+            return;
+        };
+        let result = if intent.private {
+            Ok(())
+        } else if !self.settings_writable {
+            Err("Settings are not writable; notification permission was not saved".into())
+        } else {
+            let previous = self
+                .settings
+                .notification_permissions
+                .get(&intent.origin)
+                .cloned();
+            if let Some(choice) = intent.choice {
+                self.settings
+                    .notification_permissions
+                    .insert(intent.origin.clone(), choice.text().into());
+            } else {
+                self.settings
+                    .notification_permissions
+                    .remove(&intent.origin);
+            }
+            self.save();
+            match write_settings(&self.root, &self.settings) {
+                Ok(()) => {
+                    self.settings_dirty = false;
+                    Ok(())
+                }
+                Err(error) => {
+                    if let Some(previous) = previous {
+                        self.settings
+                            .notification_permissions
+                            .insert(intent.origin, previous);
+                    } else {
+                        self.settings
+                            .notification_permissions
+                            .remove(&intent.origin);
+                    }
+                    Err(error)
+                }
+            }
+        };
+        notifications::finalize(&self.notifications, id, result, &self.proxy);
+        self.notification_ui();
+    }
     fn persist_downloads(&mut self, force: bool) -> bool {
         match downloads::persist(&self.downloads, &self.root, force) {
             Ok(()) => {
@@ -152,7 +483,13 @@ impl Browser {
         }
     }
     fn shutdown(&mut self) {
+        if let Some(cancel) = &self.update_cancel {
+            cancel.store(true, Ordering::Release);
+        }
         self.exiting = true;
+        self.cancel_ai();
+        self.cancel_ai_setup();
+        notifications::shutdown(&self.notifications, &self.proxy);
         self.close_private_tabs(false);
         downloads::cancel_all(&self.downloads);
         self.persist_downloads(true);
@@ -163,6 +500,8 @@ impl Browser {
     // X closes the window; native transfer owners stay on this event-loop
     // thread. Explicit Exit is the separate, destructive stop action.
     fn close_window(&mut self) -> bool {
+        self.cancel_ai();
+        notifications::cancel_pending(&self.notifications, &self.proxy);
         self.close_private_tabs(self.settings.background_private_downloads);
         self.save_now();
         self.persist_downloads(true);
@@ -179,6 +518,9 @@ impl Browser {
         self.window.set_visible(false);
         for tab in &mut self.tabs {
             if tab.downloading.get() == 0 {
+                if tab.view.is_some() {
+                    notifications::detach(&self.notifications, tab.id, &self.proxy);
+                }
                 tab.view.take();
                 continue;
             }
@@ -197,7 +539,7 @@ impl Browser {
         }
         self.update_tray();
         let _ = self.tray.balloon(
-            "Yas is continuing your downloads",
+            "Yas Browser is continuing your downloads",
             "Reopen Yas or use this tray icon to manage them. Exit and stop downloads ends unfinished transfers.",
         );
         false
@@ -255,6 +597,9 @@ impl Browser {
         if self.background {
             for tab in &mut self.tabs {
                 if tab.downloading.get() == 0 {
+                    if tab.view.is_some() {
+                        notifications::detach(&self.notifications, tab.id, &self.proxy);
+                    }
                     tab.view.take();
                 }
             }
@@ -267,7 +612,15 @@ impl Browser {
             .to_logical::<f64>(self.window.scale_factor());
         Rect {
             position: LogicalPosition::new(0., TOP).into(),
-            size: LogicalSize::new(s.width, (s.height - TOP).max(1.)).into(),
+            size: LogicalSize::new(
+                if self.panel && self.ai_side {
+                    (s.width - 420f64.min(s.width * 0.55)).max(1.)
+                } else {
+                    s.width
+                },
+                (s.height - TOP).max(1.),
+            )
+            .into(),
         }
     }
     fn active_tab(&self) -> Option<&Tab> {
@@ -278,6 +631,7 @@ impl Browser {
             return;
         }
         if self.panel
+            || self.notification_prompt_visible
             || self.suggestions_open
             || self.active_tab().is_none_or(|t| t.url == "yas://newtab")
         {
@@ -288,7 +642,7 @@ impl Browser {
     }
     fn toast(&self, s: &str) {
         if self.background {
-            let _ = self.tray.balloon("Yas downloads", s);
+            let _ = self.tray.balloon("Yas Browser downloads", s);
             return;
         }
         let _ = self.shell.evaluate_script(&format!("toast({})", json!(s)));
@@ -303,8 +657,18 @@ impl Browser {
             .and_then(|t| url::Url::parse(&t.url).ok())
             .and_then(|u| u.host_str().map(str::to_owned))
             .unwrap_or_default();
+        let saved_login_available = self
+            .active_tab()
+            .and_then(|tab| origin(&tab.url))
+            .is_some_and(|site| {
+                self.cache_login_sites();
+                self.login_sites
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|sites| sites.contains(&site))
+            });
         let shield = self.shield.borrow();
-        let mut data = json!({"windowMaximized":self.window.is_maximized(),"tabs":tabs,"active":self.active,"downloads":self.downloads.borrow().records,"blocked":shield.count,"rules":shield.rules,"shield":!shield.exceptions.contains(&host),"custom":self.settings.custom_filters,"updating":self.updating,"backgroundPrivateDownloads":self.settings.background_private_downloads,"background":false});
+        let mut data = json!({"savedLoginAvailable":saved_login_available,"windowMaximized":self.window.is_maximized(),"tabs":tabs,"active":self.active,"downloads":self.downloads.borrow().records,"blocked":shield.count,"rules":shield.rules,"bundledFilterCacheUsed":shield.bundled_cache_used,"shield":!shield.exceptions.contains(&host),"custom":self.settings.custom_filters,"updating":self.updating,"backgroundPrivateDownloads":self.settings.background_private_downloads,"reputationWarning":self.reputation_warning,"background":false,"appearance":self.settings.appearance,"searchEngine":self.settings.search_engine,"checkUpdates":self.settings.check_updates,"localAiModel":self.settings.local_ai_model});
         if self.library_dirty.replace(false) {
             data["bookmarks"] = json!(self.settings.bookmarks);
             data["history"] = json!(self
@@ -320,13 +684,36 @@ impl Browser {
         let _ = self.shell.evaluate_script(&format!("render({data})"));
     }
     fn save(&mut self) {
-        self.settings.session = self
-            .tabs
-            .iter()
-            .filter(|t| !t.private)
-            .map(|t| t.url.clone())
-            .collect();
+        self.settings.set_session_tabs(
+            self.tabs
+                .iter()
+                .map(|t| (t.url.as_str(), t.title.as_str(), t.private)),
+        );
         self.settings_dirty = true;
+    }
+    fn refresh_tab_title(&mut self, id: usize) {
+        let mut persist = false;
+        if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == id) {
+            if let Some(view) = &tab.view {
+                // A queued callback may belong to an earlier document or a
+                // dropped view. Read only the current view at its current URL.
+                if tab.url != "yas://newtab" && view.url().ok().as_deref() == Some(tab.url.as_str())
+                {
+                    let mut raw = PWSTR::null();
+                    if unsafe { view.webview().DocumentTitle(&mut raw) }.is_ok() {
+                        let title = take_pwstr(raw);
+                        if !title.trim().is_empty() && title != "about:blank" && title != tab.title
+                        {
+                            tab.title = title;
+                            persist = !tab.private;
+                        }
+                    }
+                }
+            }
+        }
+        if persist {
+            self.save();
+        }
     }
     // Coalesce navigation/title/tab events; flush at most once per tick and on exit.
     fn save_now(&mut self) {
@@ -351,7 +738,9 @@ impl Browser {
             }
             return;
         }
-        let full = self.panel || self.active_tab().is_none_or(|t| t.url == "yas://newtab");
+        let full = self.panel
+            || self.notification_prompt_visible
+            || self.active_tab().is_none_or(|t| t.url == "yas://newtab");
         let s = self
             .window
             .inner_size()
@@ -372,25 +761,17 @@ impl Browser {
         });
         for t in &self.tabs {
             if let Some(v) = &t.view {
-                let visible = t.id == self.active && !full;
+                let visible = t.id == self.active
+                    && (!full
+                        || (self.panel
+                            && self.ai_side
+                            && !self.notification_prompt_visible
+                            && t.url != "yas://newtab"));
                 let _ = v.set_visible(visible);
                 let _ = v.set_bounds(self.bounds());
-                unsafe {
-                    if let Ok(web) = v.webview().cast::<ICoreWebView2_3>() {
-                        if visible || t.downloading.get() > 0 {
-                            if t.suspend_requested.replace(false) {
-                                let _ = web.Resume();
-                            }
-                        } else if t.id != self.active && !t.suspend_requested.replace(true) {
-                            // Best effort: WebView2 protects media/download activity itself.
-                            let _ = web.TrySuspend(&TrySuspendCompletedHandler::create(Box::new(
-                                |_, _| Ok(()),
-                            )));
-                        }
-                    }
-                }
             }
         }
+        self.maintain_suspension();
         if self.suggestions_open {
             use windows::Win32::{
                 Foundation::HWND,
@@ -419,15 +800,16 @@ impl Browser {
         self.next += 1;
         self.tabs.push(Tab {
             id,
-            url: destination(u),
-            title: "New tab".into(),
+            url: destination_with_engine(u, &self.settings.search_engine),
+            title: fallback_tab_title(&destination_with_engine(u, &self.settings.search_engine)),
             view: None,
             source: Rc::new(RefCell::new(String::new())),
             blocked: Rc::new(Cell::new(0)),
             downloading: Rc::new(Cell::new(0)),
             used: Instant::now(),
             private,
-            suspend_requested: Cell::new(false),
+            suspension: RefCell::new(tab_memory::Suspension::default()),
+            playing_audio: Cell::new(false),
         });
         self.switch(id);
         self.save();
@@ -435,6 +817,10 @@ impl Browser {
     fn switch(&mut self, id: usize) {
         if !self.tabs.iter().any(|t| t.id == id) {
             return;
+        }
+        if self.active != id {
+            self.cancel_ai();
+            notifications::cancel_tab_pending(&self.notifications, self.active, &self.proxy);
         }
         if let Some(t) = self.tabs.iter_mut().find(|t| t.id == self.active) {
             t.used = Instant::now();
@@ -450,30 +836,128 @@ impl Browser {
                 self.toast(&e)
             }
         }
+        self.refresh_memory_pressure();
+        self.refresh_media_activity();
         self.enforce_memory_budget();
         self.layout();
         self.focus_active();
         self.snapshot();
+        self.notification_ui();
     }
-    fn enforce_memory_budget(&mut self) {
-        while self
-            .tabs
-            .iter()
-            .filter(|t| t.view.is_some() && t.downloading.get() == 0)
-            .count()
-            > 2
-        {
+    fn refresh_memory_pressure(&mut self) {
+        self.memory_policy.observe(tab_memory::memory_sample());
+    }
+    fn refresh_media_activity(&self) {
+        for tab in &self.tabs {
+            let playing = tab.view.as_ref().is_some_and(|view| unsafe {
+                let mut playing = windows::core::BOOL::default();
+                view.webview()
+                    .cast::<ICoreWebView2_8>()
+                    .and_then(|web| web.IsDocumentPlayingAudio(&mut playing))
+                    .is_ok()
+                    && playing.as_bool()
+            });
+            tab.playing_audio.set(playing);
+        }
+    }
+    fn maintain_suspension(&self) {
+        if self.background || self.exiting {
+            return;
+        }
+        for tab in &self.tabs {
+            let Some(view) = &tab.view else { continue };
+            let protected = tab.id == self.active
+                || tab_memory::keeps_running(tab.downloading.get(), tab.playing_audio.get());
+            let action = tab
+                .suspension
+                .borrow_mut()
+                .action(protected, Instant::now());
+            if action == tab_memory::SuspensionAction::None {
+                continue;
+            }
+            let native = view.webview().cast::<ICoreWebView2_3>();
+            match action {
+                tab_memory::SuspensionAction::Suspend(tag) => {
+                    let proxy = self.proxy.clone();
+                    let id = tab.id;
+                    let handler =
+                        TrySuspendCompletedHandler::create(Box::new(move |error, succeeded| {
+                            let _ = proxy.send_event(Msg::Suspension {
+                                tab: id,
+                                tag,
+                                outcome: tab_memory::SuspensionOutcome::Request(
+                                    error.is_ok() && succeeded,
+                                ),
+                            });
+                            Ok(())
+                        }));
+                    if unsafe { native.and_then(|web| web.TrySuspend(&handler)) }.is_err() {
+                        let _ = self.proxy.send_event(Msg::Suspension {
+                            tab: tab.id,
+                            tag,
+                            outcome: tab_memory::SuspensionOutcome::Request(false),
+                        });
+                    }
+                }
+                tab_memory::SuspensionAction::Check(tag) => {
+                    let mut suspended = windows::core::BOOL::default();
+                    let confirmed =
+                        unsafe { native.and_then(|web| web.IsSuspended(&mut suspended)) }.is_ok()
+                            && suspended.as_bool();
+                    let _ = self.proxy.send_event(Msg::Suspension {
+                        tab: tab.id,
+                        tag,
+                        outcome: tab_memory::SuspensionOutcome::NativeState(confirmed),
+                    });
+                }
+                tab_memory::SuspensionAction::Resume => {
+                    if let Ok(web) = native {
+                        let _ = unsafe { web.Resume() };
+                    }
+                }
+                tab_memory::SuspensionAction::None => {}
+            }
+        }
+    }
+    fn enforce_memory_budget(&mut self) -> bool {
+        let mut changed = false;
+        let suspension_failed = self.tabs.iter().any(|tab| {
+            tab.id != self.active
+                && tab.view.is_some()
+                && !tab_memory::keeps_running(tab.downloading.get(), tab.playing_audio.get())
+                && tab.suspension.borrow().needs_fallback()
+        });
+        while self.memory_policy.needs_eviction(
+            self.tabs
+                .iter()
+                .filter(|tab| {
+                    tab.view.is_some()
+                        && !tab_memory::keeps_running(
+                            tab.downloading.get(),
+                            tab.playing_audio.get(),
+                        )
+                })
+                .count(),
+            suspension_failed,
+        ) {
             if let Some(t) = self
                 .tabs
                 .iter_mut()
-                .filter(|t| t.id != self.active && t.view.is_some() && t.downloading.get() == 0)
+                .filter(|t| {
+                    t.id != self.active
+                        && t.view.is_some()
+                        && !tab_memory::keeps_running(t.downloading.get(), t.playing_audio.get())
+                })
                 .min_by_key(|t| t.used)
             {
+                notifications::detach(&self.notifications, t.id, &self.proxy);
                 t.view.take();
+                changed = true;
             } else {
                 break;
             }
         }
+        changed
     }
     fn ensure_view(&mut self) -> Result<(), String> {
         let idx = self.tabs.iter().position(|t| t.id == self.active).unwrap();
@@ -519,6 +1003,14 @@ impl Browser {
                     .map_err(|e| e.to_string())?,
             );
         }
+        if let Err(error) = notifications::initialize_profile(
+            keeper.as_ref().unwrap(),
+            &self.notifications,
+            private.then_some(self.stealth_session),
+            &self.proxy,
+        ) {
+            self.toast(&error);
+        }
         let view = WebViewBuilder::new()
             .with_environment(self.shell.environment())
             .with_profile_name(profile)
@@ -541,8 +1033,8 @@ impl Browser {
                 }
                 allowed
             })
-            .with_document_title_changed_handler(move |t| {
-                let _ = p2.send_event(Msg::Title(id, t));
+            .with_document_title_changed_handler(move |_| {
+                let _ = p2.send_event(Msg::Title(id));
             })
             .with_on_page_load_handler(move |e, u| {
                 if matches!(e, PageLoadEvent::Finished) {
@@ -551,6 +1043,12 @@ impl Browser {
             })
             .build_as_child(&self.window)
             .map_err(|e| e.to_string())?;
+        if let Err(error) = security::request_reputation_checks(&view) {
+            if self.reputation_warning.as_ref() != Some(&error) {
+                self.toast(&error);
+                self.reputation_warning = Some(error);
+            }
+        }
         shortcuts::attach(&view, self.proxy.clone()).map_err(|e| e.to_string())?;
         downloads::attach(
             &view,
@@ -632,24 +1130,42 @@ impl Browser {
                 let _ = s.SetIsPasswordAutosaveEnabled(!private);
             }
         }
-        view.load_url(&self.tabs[idx].url)
-            .map_err(|e| e.to_string())?;
+        notifications::attach(
+            &view,
+            self.notifications.clone(),
+            id,
+            private.then_some(self.stealth_session),
+            self.proxy.clone(),
+        )?;
+        if notifications::navigation_ready(&self.notifications, id) {
+            view.load_url(&self.tabs[idx].url)
+                .map_err(|e| e.to_string())?;
+        }
         self.tabs[idx].view = Some(view);
-        self.tabs[idx].suspend_requested.set(false);
+        self.tabs[idx].suspension.borrow_mut().new_view();
+        self.tabs[idx].playing_audio.set(false);
         Ok(())
     }
     fn navigate(&mut self, input: &str) {
-        let dest = destination(input);
+        self.cancel_ai();
+        notifications::cancel_tab_pending(&self.notifications, self.active, &self.proxy);
+        let dest = destination_with_engine(input, &self.settings.search_engine);
         self.panel = false;
         self.suggestions_open = false;
         if let Some(t) = self.tabs.iter_mut().find(|t| t.id == self.active) {
+            if t.url != dest {
+                t.title = fallback_tab_title(&dest);
+            }
             t.url = dest.clone();
             t.blocked.set(0);
             if dest == "yas://newtab" {
+                notifications::detach(&self.notifications, t.id, &self.proxy);
                 t.view.take();
                 t.title = "New tab".into();
             } else if let Some(v) = &t.view {
-                let _ = v.load_url(&dest);
+                if notifications::navigation_ready(&self.notifications, t.id) {
+                    let _ = v.load_url(&dest);
+                }
             }
         }
         if let Err(e) = self.ensure_view() {
@@ -659,6 +1175,7 @@ impl Browser {
         self.layout();
         self.snapshot();
         self.save();
+        self.notification_ui();
     }
     fn profile(&self) -> Result<ICoreWebView2Profile7, String> {
         let v = self
@@ -781,7 +1298,68 @@ impl Browser {
             self.login_sites.replace(None);
         }
         match cmd.as_str() {
+            "update_status" => self.update_render(),
+            "update_check" => self.check_for_update(),
+            "update_download" => self.download_update(),
+            "update_install" => self.install_update(),
+            "update_cancel" => {
+                if let Some(cancel) = &self.update_cancel {
+                    cancel.store(true, Ordering::Release);
+                    self.update_state["phase"] = json!("canceling");
+                    self.update_state["message"] = json!("Canceling the update request…");
+                    self.update_render();
+                }
+            }
+            "update_preference" => {
+                if let Some(enabled) = v["enabled"].as_bool() {
+                    self.settings.check_updates = enabled;
+                    self.save();
+                    self.snapshot();
+                }
+            }
             "suggest" => self.suggest(&text("query")),
+            "notification_answer" => {
+                let id = v["id"].as_u64().unwrap_or(0) as usize;
+                if !notifications::prompt_belongs_to(&self.notifications, id, self.active) {
+                    self.toast("This notification request has expired");
+                    self.notification_ui();
+                    return;
+                }
+                if let Err(error) = notifications::answer(
+                    &self.notifications,
+                    id,
+                    notifications::Decision::parse(&text("decision")),
+                    &self.proxy,
+                ) {
+                    self.toast(&error)
+                }
+                self.notification_ui();
+            }
+            "notification_reset" => {
+                let private = v["private"].as_bool().unwrap_or(false);
+                if private && !self.active_tab().is_some_and(|tab| tab.private) {
+                    self.toast("Open a Stealth tab to manage its session permissions");
+                } else if let Err(error) = notifications::reset(
+                    &self.notifications,
+                    &text("origin"),
+                    private.then_some(self.stealth_session),
+                    &self.proxy,
+                ) {
+                    self.toast(&error)
+                }
+                self.notification_ui();
+            }
+            "notification_settings" => {
+                if let Err(error) = self.notification_profile() {
+                    self.toast(&error)
+                }
+                self.notification_ui();
+            }
+            "notification_focus_page" => {
+                if !self.notification_prompt_visible && !self.panel && !self.suggestions_open {
+                    self.focus_active();
+                }
+            }
             "suggestions_open" => {
                 self.suggestions_open = v["open"].as_bool().unwrap_or(false);
                 self.suggestions_height = v["height"]
@@ -860,11 +1438,18 @@ impl Browser {
             "switch" => self.switch(v["id"].as_u64().unwrap_or_default() as usize),
             "close" => {
                 let id = v["id"].as_u64().unwrap_or_default() as usize;
+                if self.ai_source.as_ref().is_some_and(|source| source.0 == id) {
+                    self.cancel_ai();
+                }
+                let closed_private = self.tabs.iter().any(|tab| tab.id == id && tab.private);
+                notifications::detach(&self.notifications, id, &self.proxy);
                 downloads::cancel_tab(&self.downloads, id);
                 self.tabs.retain(|t| t.id != id);
-                if !self.tabs.iter().any(|t| t.private) {
-                    self.stealth_keeper.take();
+                if closed_private && !self.tabs.iter().any(|t| t.private) {
+                    let ended = self.stealth_session;
                     self.stealth_session += 1;
+                    notifications::end_private(&self.notifications, ended, &self.proxy);
+                    self.stealth_keeper.take();
                     downloads::forget_private_finished(&self.downloads);
                 }
                 if self.tabs.is_empty() {
@@ -878,6 +1463,32 @@ impl Browser {
                 self.update_tray();
             }
             "navigate" => self.navigate(&text("url")),
+            "preferences" => {
+                if let Some(value) = v["appearance"]
+                    .as_str()
+                    .filter(|value| matches!(*value, "system" | "light" | "dark"))
+                {
+                    self.settings.appearance = value.into();
+                }
+                if let Some(value) = v["search_engine"]
+                    .as_str()
+                    .filter(|value| matches!(*value, "bing" | "google" | "duckduckgo" | "brave"))
+                {
+                    self.settings.search_engine = value.into();
+                }
+                if let Some(value) = v["local_ai_model"].as_str().filter(|value| {
+                    !value.is_empty() && value.len() <= 256 && !value.chars().any(char::is_control)
+                }) {
+                    self.settings.local_ai_model = value.into();
+                }
+                self.save();
+                self.snapshot();
+            }
+            "ai_models" => self.ai_models(),
+            "ai_ask" => self.ask_ai(text("question")),
+            "ai_cancel" => self.cancel_ai(),
+            "ai_setup" => self.setup_ai(),
+            "ai_setup_cancel" => self.cancel_ai_setup(),
             "back" | "forward" | "reload" | "stop" | "devtools" | "zoom_in" | "zoom_out"
             | "zoom_reset" | "print" | "find" => {
                 if let Some(view) = self.active_tab().and_then(|t| t.view.as_ref()) {
@@ -919,6 +1530,7 @@ impl Browser {
             "panel" => {
                 self.suggestions_open = false;
                 self.panel = v["open"].as_bool().unwrap_or(false);
+                self.ai_side = self.panel && v["side"].as_bool().unwrap_or(false);
                 if !self.panel && !self.background {
                     if let Err(error) = self.ensure_view() {
                         self.toast(&error);
@@ -963,7 +1575,8 @@ impl Browser {
             }
             "sleep" => {
                 for t in &mut self.tabs {
-                    if t.id != self.active && t.downloading.get() == 0 {
+                    if t.id != self.active && t.downloading.get() == 0 && t.view.is_some() {
+                        notifications::detach(&self.notifications, t.id, &self.proxy);
                         t.view.take();
                     }
                 }
@@ -987,7 +1600,6 @@ impl Browser {
                     self.toast("Site protection changed. Reload to apply cosmetic changes.");
                 }
             }
-            "check_app_update" => ota::check(true),
             "update_filters" => self.update_filters(),
             "custom_filters" => {
                 self.settings.custom_filters = text("rules");
@@ -1159,8 +1771,8 @@ impl Browser {
             "import_browser_data" => {
                 if let Some(path) = rfd::FileDialog::new()
                     .set_parent(&self.window)
-                    .set_title("Import browser data")
-                    .add_filter("Browser export JSON", &["json"])
+                    .set_title("Choose bookmarks or browser data")
+                    .add_filter("Browser JSON / native Bookmarks file", &["json", "*"])
                     .pick_file()
                 {
                     self.save_now();
@@ -1291,24 +1903,116 @@ impl Browser {
             _ => (),
         }
     }
+    fn update_render(&self) {
+        let _ = self
+            .shell
+            .evaluate_script(&format!("updateData({})", self.update_state));
+    }
+    fn check_for_update(&mut self) {
+        if self.update_cancel.is_some() {
+            return;
+        }
+        self.next_update_check = Instant::now() + Duration::from_secs(86400);
+        self.update_request = self.update_request.wrapping_add(1);
+        let request = self.update_request;
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.update_cancel = Some(cancel.clone());
+        self.update_state = json!({"phase":"checking","message":"Checking for updates…"});
+        self.update_render();
+        let proxy = self.proxy.clone();
+        std::thread::spawn(move || {
+            let result = updater::check(&cancel);
+            let _ = proxy.send_event(Msg::UpdateChecked { request, result });
+        });
+    }
+    fn download_update(&mut self) {
+        if self.update_cancel.is_some() {
+            return;
+        }
+        let Some((release, envelope)) = self.update_release.clone() else {
+            return;
+        };
+        self.update_request = self.update_request.wrapping_add(1);
+        let request = self.update_request;
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.update_cancel = Some(cancel.clone());
+        self.update_state = json!({"phase":"downloading","version":release.version,"notes":release.notes,"completed":0,"total":release.bytes,"message":"Downloading a verified update…"});
+        self.update_render();
+        let root = self.root.clone();
+        let proxy = self.proxy.clone();
+        std::thread::spawn(move || {
+            let progress = proxy.clone();
+            let result =
+                updater::download(&root, &release, &envelope, &cancel, |completed, total| {
+                    let _ = progress.send_event(Msg::UpdateProgress {
+                        request,
+                        completed,
+                        total,
+                    });
+                });
+            let _ = proxy.send_event(Msg::UpdateDownloaded { request, result });
+        });
+    }
+    fn install_update(&mut self) {
+        if self.update_state["phase"] != "ready" {
+            return;
+        }
+        if self.update_cancel.is_some() {
+            return;
+        }
+        if downloads::needs_background(&self.downloads, true)
+            || self.ai_inflight.is_some()
+            || self.ai_cancel.is_some()
+            || self.ai_setup_cancel.is_some()
+        {
+            self.toast(
+                "Finish or cancel browser downloads and AI tasks before restarting to update.",
+            );
+            return;
+        }
+        let Some(installer) = self.update_installer.clone() else {
+            return;
+        };
+        self.save();
+        let result = (|| -> Result<(), String> {
+            if !self.settings_writable {
+                return Err("Browser settings are not writable. The update was deferred.".into());
+            }
+            write_settings(&self.root, &self.settings)?;
+            downloads::persist(&self.downloads, &self.root, true)?;
+            updater::launch_handoff(&self.root, &installer)
+        })();
+        match result {
+            Ok(()) => {
+                self.update_state["phase"] = json!("installing");
+                self.update_render();
+                self.toast("Restarting to install the verified update…");
+                let _ = self.proxy.send_event(Msg::Exit);
+            }
+            Err(error) => self.toast(&error),
+        }
+    }
+    fn cache_login_sites(&self) {
+        if self.login_sites.borrow().is_none() {
+            let sites = read_vault(&self.root)
+                .map(|vault| {
+                    let mut seen = std::collections::HashSet::new();
+                    vault
+                        .logins
+                        .into_iter()
+                        .map(|l| l.origin)
+                        .filter(|s| seen.insert(s.clone()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            self.login_sites.replace(Some(sites));
+        }
+    }
     fn suggest(&self, query: &str) {
         let items = if query.trim().chars().count() < 2 || query.len() > 512 {
             Vec::new()
         } else {
-            if self.login_sites.borrow().is_none() {
-                let sites = read_vault(&self.root)
-                    .map(|vault| {
-                        let mut seen = std::collections::HashSet::new();
-                        vault
-                            .logins
-                            .into_iter()
-                            .map(|l| l.origin)
-                            .filter(|s| seen.insert(s.clone()))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                self.login_sites.replace(Some(sites));
-            }
+            self.cache_login_sites();
             let sites = self.login_sites.borrow();
             suggestions::search(
                 &self.settings,
@@ -1476,20 +2180,54 @@ impl Browser {
     }
 }
 fn main() {
-    if ota::diagnostic(){return;}
     if let Err(e) = run() {
-        if std::env::args().any(|a| a == "--import-data") {
+        if std::env::args().any(|a| {
+            matches!(
+                a.as_str(),
+                "--import-data"
+                    | "--verify-storage-migration"
+                    | "--export-storage"
+                    | "--yas-verify-update-feed"
+            )
+        }) {
             eprintln!("Import failed: {e}");
             std::process::exit(1);
         }
         rfd::MessageDialog::new()
-            .set_title("Yas could not start")
+            .set_title("Yas Browser could not start")
             .set_description(e.to_string())
             .show();
     }
 }
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<_> = std::env::args().collect();
+    if args.len() == 2 && args[1] == "--yas-version" {
+        println!("{}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+    if args.iter().any(|arg| arg == "--yas-verify-update-feed") {
+        if args.len() != 3 || args[1] != "--yas-verify-update-feed" {
+            return Err("Update verification requires one signed feed file.".into());
+        }
+        let release = updater::verify_feed_file(std::path::Path::new(&args[2]))?;
+        println!(
+            "{}",
+            json!({"valid":true,"version":release.version,"platform":release.platform})
+        );
+        return Ok(());
+    }
+    if updater::apply_handoff(&args)? {
+        return Ok(());
+    }
+    if args.iter().any(|a| {
+        matches!(
+            a.as_str(),
+            "--verify-storage-migration" | "--export-storage"
+        )
+    }) && !args.iter().any(|a| a == "--user-data-dir")
+    {
+        return Err("Storage maintenance requires an explicit --user-data-dir.".into());
+    }
     let root = if let Some(i) = args.iter().position(|s| s == "--user-data-dir") {
         PathBuf::from(
             args.get(i + 1)
@@ -1506,7 +2244,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let activation_only = !args.iter().any(|arg| {
                 matches!(
                     arg.as_str(),
-                    "--import-data" | "--import-passwords" | "--import-report" | "--load-extension"
+                    "--import-data"
+                        | "--import-passwords"
+                        | "--import-report"
+                        | "--load-extension"
+                        | "--verify-storage-migration"
+                        | "--export-storage"
                 )
             });
             if activation_only {
@@ -1534,6 +2277,26 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     };
+    if args.iter().any(|arg| arg == "--verify-storage-migration") {
+        println!("{}", database::verify_migration(&root)?);
+        return Ok(());
+    }
+    // Keep one handle for the profile lifetime; wrappers share it without
+    // reopening the database or holding transactions across native callbacks.
+    let store = open_profile(&root)?;
+    if let Some(index) = args.iter().position(|arg| arg == "--export-storage") {
+        let destination = PathBuf::from(
+            args.get(index + 1)
+                .filter(|value| !value.starts_with("--"))
+                .ok_or("--export-storage requires a separate private directory")?,
+        );
+        export_legacy_backup(&root, &destination)?;
+        println!(
+            "{}",
+            json!({"version":env!("CARGO_PKG_VERSION"),"mode":"storage-export","passed":true})
+        );
+        return Ok(());
+    }
     if let Some(i) = args.iter().position(|s| s == "--import-data") {
         let input = PathBuf::from(
             args.get(i + 1)
@@ -1558,6 +2321,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         storage::atomic_write(&path, &serde_json::to_vec_pretty(&report)?)?;
         return Ok(());
     }
+    local_ai::configure_storage(&root)?;
     let proxy_slot = Rc::new(RefCell::new(None));
     let mut builder = EventLoopBuilder::<Msg>::with_user_event();
     builder.with_msg_hook(background::hook(proxy_slot.clone()));
@@ -1576,7 +2340,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         settings.exceptions.clone(),
     )));
     let window = WindowBuilder::new()
-        .with_title("Yas")
+        .with_title("Yas Browser")
         .with_decorations(false)
         .with_window_icon(
             tao::window::Icon::from_rgba(include_bytes!("../branding/icon.rgba").to_vec(), 64, 64)
@@ -1586,11 +2350,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .with_min_inner_size(LogicalSize::new(760., 500.))
         .build(&event_loop)?;
     let tray = background::Tray::new(&window)?;
+    let notification_manager = Rc::new(RefCell::new(notifications::Manager::new(
+        &settings.notification_permissions,
+    )));
     // Only the website profile receives installed extensions. UI and private profiles stay empty.
     // Remote pages have no privileged IPC handler. Profiles share the engine to reduce overhead.
     let p = proxy.clone();
     let mut shell_context = WebContext::new(Some(root.join("shell")));
     let shell = WebViewBuilder::new_with_web_context(&mut shell_context)
+        .with_additional_browser_args(security::ENVIRONMENT_ARGUMENTS)
         .with_custom_protocol("yas-ui".into(), |_, _| {
             wry::http::Response::builder()
                 .header("Content-Type", "text/html; charset=utf-8")
@@ -1625,14 +2393,26 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         active: 0,
         next: 1,
         panel: false,
+        ai_side: false,
         suggestions_open: false,
         suggestions_height: TOP,
         login_sites: RefCell::new(None),
+        update_request: 0,
+        update_cancel: None,
+        update_release: None,
+        update_installer: None,
+        update_state: json!({"phase":"idle","message":"Check for a new Yas Browser release."}),
+        next_update_check: Instant::now() + Duration::from_secs(60),
         root,
+        store: Some(store),
         settings,
         shield,
         proxy: proxy.clone(),
         downloads: Rc::new(RefCell::new(download_manager)),
+        notifications: notification_manager,
+        notification_prompt_visible: false,
+        reputation_warning: None,
+        notification_prompt_id: None,
         updating: false,
         settings_dirty: false,
         settings_writable: true,
@@ -1644,31 +2424,36 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         pending_download_prompts: Vec::new(),
         download_error: download_warning,
         exiting: false,
+        memory_policy: tab_memory::MemoryPolicy::default(),
+        ai_request: 0,
+        ai_cancel: None,
+        ai_source: None,
+        ai_inflight: None,
+        ai_models_request: 0,
+        ai_setup_request: 0,
+        ai_setup_cancel: None,
     };
-    let session = app.settings.session.clone();
+    let session = app.settings.restored_session_tabs();
     if session.is_empty() {
         app.add("yas://newtab", false)
     } else {
         // Restore every saved tab as metadata; only the selected page loads.
         // Capping this list would silently erase the rest on the next save.
-        for u in session {
+        for saved in session {
             let id = app.next;
             app.next += 1;
             app.tabs.push(Tab {
                 id,
-                url: destination(&u),
-                title: if u == "yas://newtab" {
-                    "New tab".into()
-                } else {
-                    "Restored tab".into()
-                },
+                url: destination(&saved.url),
+                title: saved.title,
                 view: None,
                 source: Rc::new(RefCell::new(String::new())),
                 blocked: Rc::new(Cell::new(0)),
                 downloading: Rc::new(Cell::new(0)),
                 used: Instant::now(),
                 private: false,
-                suspend_requested: Cell::new(false),
+                suspension: RefCell::new(tab_memory::Suspension::default()),
+                playing_audio: Cell::new(false),
             });
         }
         app.switch(app.tabs[0].id);
@@ -1688,7 +2473,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .is_none_or(|age| age > Duration::from_secs(4 * 24 * 3600))
     {
         app.update_filters();
-        ota::check(false);
     }
     std::thread::spawn(move || loop {
         std::thread::sleep(Duration::from_secs(2));
@@ -1699,10 +2483,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut last_blocked = 0;
     event_loop.run(move |event, _, flow| {
         if matches!(event, Event::LoopDestroyed) {
+            if let Some(cancel)=&app.update_cancel {cancel.store(true,Ordering::Release);}
+            app.cancel_ai();
+            app.cancel_ai_setup();
+            local_ai::shutdown();
+            notifications::shutdown(&app.notifications, &app.proxy);
             app.save_now();
             if app.downloads.try_borrow().is_ok() {
                 let _ = downloads::persist(&app.downloads, &app.root, true);
             }
+            app.store.take();
             return;
         }
         if app.exiting {
@@ -1731,6 +2521,30 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 app.snapshot();
             }
             Event::UserEvent(msg) => match msg {
+                Msg::UpdateChecked{request,result}=>{
+                    if request==app.update_request {
+                        app.update_cancel=None;
+                        match result {
+                            Ok(Some((release,envelope)))=>{app.update_installer=None;app.update_state=json!({"phase":"available","version":release.version,"notes":release.notes,"total":release.bytes,"message":format!("Yas Browser {} is available.",release.version)});app.update_release=Some((release,envelope));if !app.background{app.toast("A Yas Browser update is available in Settings → Updates.");}},
+                            Ok(None)=>{app.update_release=None;app.update_installer=None;app.update_state=json!({"phase":"current","message":"Yas Browser is up to date."});},
+                            Err(error)=>{app.update_state=json!({"phase":"error","message":error});},
+                        }
+                        app.update_render();
+                    }
+                }
+                Msg::UpdateDownloaded{request,result}=>{
+                    if request==app.update_request {
+                        app.update_cancel=None;
+                        match result {
+                            Ok(path)=>{app.update_installer=Some(path);app.update_state["phase"]=json!("ready");app.update_state["message"]=json!("Update verified. Restart when your downloads and AI tasks finish.");},
+                            Err(error)=>{app.update_state["phase"]=json!("available");app.update_state["message"]=json!(error);},
+                        }
+                        app.update_render();
+                    }
+                }
+                Msg::UpdateProgress{request,completed,total}=>{
+                    if request==app.update_request&&app.update_state["phase"]=="downloading" {app.update_state["completed"]=json!(completed);app.update_state["total"]=json!(total);app.update_render();}
+                }
                 Msg::CloseWindow => {
                     if app.close_window() {
                         *flow = ControlFlow::Exit;
@@ -1768,12 +2582,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 Msg::DownloadChanged => {
+                    app.maintain_suspension();
                     app.enforce_memory_budget();
                     app.release_background_views();
                     app.persist_downloads(false);
                     app.update_tray();
                     app.snapshot();
                 }
+                Msg::NotificationsChanged => app.notification_ui(),
+                Msg::NotificationCommit(id) => app.notification_commit(id),
                 Msg::Ui(v) => app.ui(v),
                 Msg::Toast(s) => app.toast(&s),
                 Msg::Popup(u, private) => {
@@ -1792,24 +2609,42 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                             *t.source.borrow_mut() = u;
                         }
                     }
+                    if app.ai_source.is_some() && !app.ai_request_matches(app.ai_request) {
+                        app.cancel_ai();
+                    }
                     app.snapshot();
                     app.save();
                 }
                 Msg::Navigate(id, u) => {
+                    if id == app.active {
+                        app.cancel_ai();
+                    }
                     if let Some(t) = app.tabs.iter_mut().find(|t| t.id == id) {
+                        if t.url != u {
+                            t.title = fallback_tab_title(&u);
+                        }
                         t.url = u;
                     }
                     app.snapshot();
                 }
-                Msg::Title(id, title) => {
-                    if let Some(t) = app.tabs.iter_mut().find(|t| t.id == id) {
-                        if t.view.is_some() && t.url != "yas://newtab" {
-                            t.title = title;
-                        }
-                    }
+                Msg::Title(id) => {
+                    app.refresh_tab_title(id);
                     app.snapshot();
                 }
                 Msg::Loaded(id, u) => {
+                    if !app.tabs.iter().any(|tab| {
+                        tab.id == id
+                            && tab.url == u
+                            && tab
+                                .view
+                                .as_ref()
+                                .and_then(|view| view.url().ok())
+                                .as_deref()
+                                == Some(u.as_str())
+                    }) {
+                        return;
+                    }
+                    app.refresh_tab_title(id);
                     if let Some(t) = app.tabs.iter().find(|t| t.id == id) {
                         if let Some(view) = &t.view {
                             blocker::cosmetic(view, app.shield.clone(), u.clone());
@@ -1852,7 +2687,24 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     app.snapshot();
                 }
+                Msg::Suspension { tab, tag, outcome } => {
+                    if let Some(tab) = app
+                        .tabs
+                        .iter()
+                        .find(|current| current.id == tab && current.view.is_some())
+                    {
+                        tab.suspension
+                            .borrow_mut()
+                            .complete(tag, outcome, Instant::now());
+                    }
+                    if app.enforce_memory_budget() {
+                        app.snapshot();
+                    }
+                }
                 Msg::Tick => {
+                    if app.settings.check_updates&&Instant::now()>=app.next_update_check&&!app.background&&app.active_tab().is_some_and(|t|!t.private)&&app.update_cancel.is_none() {
+                        app.check_for_update();
+                    }
                     downloads::poll(&app.downloads, &app.proxy);
                     app.release_background_views();
                     app.persist_downloads(false);
@@ -1860,12 +2712,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     if app.settings_dirty {
                         app.save_now();
                     }
-                    let mut changed = false;
+                    app.refresh_memory_pressure();
+                    app.refresh_media_activity();
+                    app.maintain_suspension();
+                    let mut changed = app.enforce_memory_budget();
                     for t in &mut app.tabs {
                         if t.id != app.active
-                            && t.downloading.get() == 0
+                            && !tab_memory::keeps_running(
+                                t.downloading.get(),
+                                t.playing_audio.get(),
+                            )
                             && t.used.elapsed() > Duration::from_secs(120)
                         {
+                            if t.view.is_some() {
+                                notifications::detach(&app.notifications, t.id, &app.proxy);
+                            }
                             changed |= t.view.take().is_some();
                         }
                     }
@@ -1882,6 +2743,91 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     let _ = app
                         .shell
                         .evaluate_script(&format!("extensionData({})", json!(e)));
+                }
+                Msg::AiModels { request, models } => {
+                    if request == app.ai_models_request && app.ai_setup_cancel.is_none() {
+                        match models {
+                            Ok(models) => {
+                                if let Some(model) = models.first().filter(|_| !models.iter().any(|model| model.name == app.settings.local_ai_model)) {
+                                    app.settings.local_ai_model = model.name.clone();
+                                    app.save();
+                                    app.snapshot();
+                                }
+                                app.ai_render(json!({"models":models,"error":""}));
+                            }
+                            Err(error) => app.ai_render(json!({"models":[],"error":error})),
+                        }
+                    }
+                }
+                Msg::AiSetupProgress { request, progress } => {
+                    if request == app.ai_setup_request
+                        && app.ai_setup_cancel.as_ref().is_some_and(|cancel| !cancel.load(Ordering::Acquire))
+                    {
+                        app.ai_render(json!({"setupBusy":true,"setupStatus":progress.status,"setupCompleted":progress.completed,"setupTotal":progress.total}));
+                    }
+                }
+                Msg::AiSetupDone { request, result } => {
+                    if request == app.ai_setup_request && app.ai_setup_cancel.take().is_some() {
+                        match result {
+                            Ok(()) => {
+                                app.settings.local_ai_model = local_ai::SETUP_MODEL.into();
+                                app.save();
+                                app.snapshot();
+                                app.ai_render(json!({"setupBusy":false,"setupStatus":"Local AI is ready","error":""}));
+                                app.ai_models();
+                            }
+                            Err(error) => app.ai_render(json!({"setupBusy":false,"setupStatus":"","error":error})),
+                        }
+                    }
+                }
+                Msg::AiContext {
+                    request,
+                    context,
+                    question,
+                } => {
+                    if app.ai_request_matches(request) {
+                        match context {
+                            Ok((url, text))
+                                if app.ai_source.as_ref().is_some_and(|source| source.1 == url) =>
+                            {
+                                let model = app.settings.local_ai_model.clone();
+                                let cancel = app.ai_cancel.as_ref().unwrap().clone();
+                                let proxy = app.proxy.clone();
+                                app.ai_inflight = Some(request);
+                                std::thread::spawn(move || {
+                                    let answer =
+                                        local_ai::generate(&model, &question, &text, &cancel);
+                                    let _ = proxy.send_event(Msg::AiAnswer { request, answer });
+                                });
+                            }
+                            context => {
+                                let error = context.err().unwrap_or_else(|| {
+                                    "The page changed. Ask again on the current page.".into()
+                                });
+                                app.cancel_ai();
+                                app.ai_render(json!({"busy":false,"error":error}));
+                            }
+                        }
+                    }
+                }
+                Msg::AiAnswer { request, answer } => {
+                    let finished = app.ai_inflight == Some(request);
+                    if finished {
+                        app.ai_inflight = None;
+                    }
+                    if app.ai_request_matches(request) {
+                        app.ai_cancel.take();
+                        match answer {
+                            Ok(answer) => {
+                                app.ai_render(json!({"busy":false,"answer":answer,"error":""}))
+                            }
+                            Err(error) => {
+                                app.ai_render(json!({"busy":false,"answer":"","error":error}))
+                            }
+                        }
+                    } else if finished {
+                        app.ai_render(json!({"busy":false,"error":""}));
+                    }
                 }
             },
             _ => (),

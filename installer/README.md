@@ -3,7 +3,7 @@
 Build with Inno Setup 6.7+ or 7:
 
 ```powershell
-.\package.ps1 -Executable .\Yas.exe -Version 0.4.5 -Compiler 'C:\path\to\ISCC.exe'
+.\package.ps1 -Executable .\Yas.exe -Version 0.4.9 -Compiler 'C:\path\to\ISCC.exe'
 ```
 
 The per-user installer targets `%LOCALAPPDATA%\Programs\Yas`, creates a Start menu shortcut, and offers an optional desktop shortcut. It does not request administrator access or change the default browser. It includes the app and dependency notices, not Rust source/build caches. Uninstall removes application files and shortcuts while preserving `%LOCALAPPDATA%\Yas\Yas\data`. The stable application ID recognizes the previous browser. For the rename upgrade, setup verifies the registered legacy product and uninstaller path, runs that product's uninstaller to remove its logged application files/shortcuts, then installs Yas in the new folder. Existing profile data remains separate; Yas migrates it on first launch. The installer never recursively deletes a profile directory.
@@ -16,7 +16,9 @@ The installer uses `CloseApplications=no` and an exclusive, no-write update prob
 
 From 0.4.5, Setup compares numeric versions from the target executable and the same-product registration. A newer installed version blocks replacement; an equal-version repair or an upgrade is allowed. Previously distributed installers retain their original behavior, so use the current installer rather than an older file for repairs.
 
-Regular download metadata is preserved separately in `downloads.dpapi`; it is encrypted for the current Windows account. Private transfer records are not saved. Preserving this file does not preserve a live operation: after a true process/Windows restart unfinished regular entries must show Interrupted and must not offer native Continue without a new operation.
+Application records now live in `yas.redb` with its `yas.storage-version` marker. Password/autofill and regular-download payloads remain encrypted for the current Windows account. Legacy `settings.json`, `vault.dpapi` and `downloads.dpapi` remain recovery inputs; the installer preserves all of these files. Private transfer records are not saved. Preserving download metadata does not preserve a live operation: after a true process/Windows restart unfinished regular entries must show Interrupted and must not offer native Continue without a new operation.
+
+The installer and portable ZIP include the verified CPU-only `ai-runtime` payload and notices. Models are excluded. Users explicitly start the separate model download in Yas; setup never downloads a model or registers a background AI service. Running owned runtime images block update/uninstall preparation until Yas exits.
 
 WebView2 is detected from Microsoft's documented EdgeUpdate registry keys in 32-bit and 64-bit views. The official Microsoft-signed Evergreen Bootstrapper is bundled. If the Runtime is absent, interactive Setup asks Yes/No before running the helper with `/silent /install`, then rechecks for the Runtime before copying Yas files. This runs from the non-elevated, per-user Yas installer; Microsoft may use its existing machine-wide updater if one is already present. If the Runtime is already present, the helper is not run. Silent Yas Setup without a Runtime fails with instructions; it does not assume consent. This is an online bootstrapper, not the full offline engine installer. It requires internet when installing a missing Runtime. The portable ZIP contains the same helper and instructions in `prerequisites/`.
 
